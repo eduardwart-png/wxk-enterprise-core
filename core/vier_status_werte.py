@@ -32,8 +32,8 @@ def product_readiness(produkt: str) -> dict:
     (siehe WXK-VERBUNDWERK-DOD-MATRIX-20260914.md fuer die vollstaendige
     Einzelaufschluesselung -- hier nur der zusammengefasste Wert + Ampel)."""
     werte = {
-        "WXK": {"prozent": 55, "quelle": "gewichtete DoD-Matrix, Stand 14.09.2026 nach Document-Lineage-Block"},
-        "Verbundwerk": {"prozent": 66, "quelle": "gewichtete DoD-Matrix, Stand 14.09.2026 nach E2E-Block"},
+        "WXK": {"prozent": 58, "quelle": "gewichtete DoD-Matrix, Stand 14.09.2026 nach Final-Closure-Block (Document Lineage, Matching, Workbench-Erweiterung)"},
+        "Verbundwerk": {"prozent": 69, "quelle": "gewichtete DoD-Matrix, Stand 14.09.2026 nach CRM-API-Erweiterung + CI-Fix"},
     }
     if produkt not in werte:
         return {"produkt": produkt, "status": "UNKNOWN", "prozent": None}
