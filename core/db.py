@@ -79,6 +79,36 @@ CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_tenant ON sessions(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_log(tenant_id);
 
+-- Feature Flags (Master-Prompt §42, Continuation-Order §5)
+CREATE TABLE IF NOT EXISTS feature_flags (
+    flag_key        TEXT NOT NULL,
+    tenant_id       TEXT REFERENCES tenants(tenant_id),  -- NULL = globaler Default
+    enabled         INTEGER NOT NULL DEFAULT 0,
+    rollout_prozent INTEGER NOT NULL DEFAULT 0 CHECK (rollout_prozent BETWEEN 0 AND 100),
+    beschreibung    TEXT,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (flag_key, tenant_id)
+);
+
+-- Background Jobs / Queue (Master-Prompt §35/§36, Continuation-Order §5:
+-- Retry, Backoff, Dead Letter Queue, Idempotency als Shared-Core-Pflicht)
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id          TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(tenant_id),
+    job_type        TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    payload_json    TEXT,
+    status          TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'RETRYING', 'FAILED_DLQ')),
+    versuche        INTEGER NOT NULL DEFAULT 0,
+    max_versuche    INTEGER NOT NULL DEFAULT 3,
+    letzter_fehler  TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (tenant_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status ON jobs(tenant_id, status);
+
 INSERT OR IGNORE INTO roles (role_name, beschreibung) VALUES
     ('OWNER', 'Voller Zugriff, alle Mandanten (nur Eduard, Root Admin)'),
     ('ADMIN', 'Voller Zugriff innerhalb des eigenen Mandanten'),
