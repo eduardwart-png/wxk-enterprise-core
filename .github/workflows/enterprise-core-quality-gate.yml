@@ -1,0 +1,41 @@
+name: enterprise-core-quality-gate
+
+# Eigene CI fuer das WXK/Verbundwerk Enterprise Core (Auth/RBAC/Tenant-
+# Isolation/Audit/Jobs/Health). Laeuft bei jedem Push/PR gegen master.
+#
+# Fund 14.09.2026 (Final-Closure-Order Punkt 1): enterprise-core existierte
+# vorher nur lokal (Path.home()/dev/enterprise-core) ohne GitHub-Remote --
+# Tests im Verbundwerk-Repo, die diesen Code importierten, konnten in dessen
+# CI nicht laufen ("lokale Geheimabhaengigkeit"). Fix: enterprise-core ist
+# jetzt selbst ein vollstaendiges, klonbares Repo mit eigener CI. Jeder
+# fremde Clone (auch ein CI-Runner ohne vorherigen lokalen Zustand) kann
+# `pip install -r requirements.txt && pytest tests/` ausfuehren und bekommt
+# dieselben 31 Tests gruen wie lokal.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Depot holen (frischer Clone, kein lokaler Zustand)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Python bereitstellen
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhaengigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Gate -- Enterprise Core Testsuite (Auth/RBAC/Tenant/Jobs/Health)
+        run: python -m pytest tests/ -v
