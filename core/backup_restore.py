@@ -1,5 +1,5 @@
 """
-Enterprise Core — Backup + Restore Validierung (NXT.TAX Spec §43/§44/PHASE 25).
+Enterprise Core — Backup + Restore Validierung (WXK.TAX Spec §43/§44/PHASE 25).
 
 Backup allein zaehlt nicht -- Restore muss real getestet werden. Prueft:
 BACKUP -> ISOLATED RESTORE -> ROW COUNTS -> HASH CHECK -> TENANT-DATEN LESBAR.

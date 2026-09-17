@@ -1,4 +1,4 @@
-"""Tests fuer backup_restore.py -- RECOVERY GATE (NXT.TAX Spec §44/PHASE 25)."""
+"""Tests fuer backup_restore.py -- RECOVERY GATE (WXK.TAX Spec §44/PHASE 25)."""
 import sys
 from pathlib import Path
 
