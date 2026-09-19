@@ -90,6 +90,22 @@ CREATE TABLE IF NOT EXISTS feature_flags (
     PRIMARY KEY (flag_key, tenant_id)
 );
 
+-- Portal-Links (Master-Spec §10/§43: Mandanten-/Kunden-Selbstbedienungslinks
+-- duerfen NIEMALS allein durch eine erratbare Client-ID autorisieren --
+-- WXK.TAX Hermes Final Limit Closure §4/§5. Serverseitig gebundener,
+-- zeitlich begrenzter, widerrufbarer Zufalls-Token statt Query-Parameter.
+-- Generisch fuer jedes Produkt nutzbar (Kanzlei-Mandant, B2B-Kunde etc.).
+CREATE TABLE IF NOT EXISTS portal_links (
+    token           TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(tenant_id),
+    client_id       TEXT NOT NULL,  -- produktspezifische ID (z.B. Mandant M-3), NICHT die Autoritaet selbst
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at      TEXT NOT NULL,
+    revoked         INTEGER NOT NULL DEFAULT 0,
+    last_used_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_portal_links_tenant ON portal_links(tenant_id);
+
 -- Background Jobs / Queue (Master-Prompt §35/§36, Continuation-Order §5:
 -- Retry, Backoff, Dead Letter Queue, Idempotency als Shared-Core-Pflicht)
 CREATE TABLE IF NOT EXISTS jobs (
