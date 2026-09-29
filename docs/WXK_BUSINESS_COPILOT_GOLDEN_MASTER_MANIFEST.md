@@ -2,7 +2,7 @@
 
 **Status:** GOLDEN MASTER — ARCHITECTURE LOCKED  
 **Datum:** 2026-09-29  
-**Scope:** Architektur, Governance und Produktziel  
+**Scope:** Architektur, Governance, Produktziel und Umsetzungsreihenfolge  
 **Produktive Implementierung:** NOCH NICHT vollständig abgeschlossen
 
 ---
@@ -18,6 +18,7 @@ Die WXK-Business-Copilot-Architektur besteht verbindlich aus:
 5. `ADR-001-SAAS-TRUST-BOUNDARY-ROLE-DATA-PLANE.md`
 6. `WXK_BUSINESS_COPILOT_KNOWLEDGE_PRIVACY_EXTENSION.md`
 7. `WXK_BUSINESS_COPILOT_FINAL_ADVERSARIAL_ARCHITECTURE_AUDIT_2026-09-29.md`
+8. `WXK_BUSINESS_COPILOT_GOLDEN_MASTER_EXECUTION_PLAN.md`
 
 Dieses Manifest setzt den Gesamtstatus auf **GOLDEN MASTER**. Frühere Statusangaben wie `CANONICAL CANDIDATE` in einzelnen Teildokumenten sind damit für den Gesamtverbund superseded.
 
@@ -79,6 +80,9 @@ Jede Änderung benötigt:
 ### Architektur
 **GOLDEN MASTER**
 
+### Ausführungsreihenfolge
+**EXECUTION CANON**
+
 ### Shared Core aktueller Code
 **FOUNDATION — Migration/Erweiterung erforderlich**
 
@@ -104,5 +108,7 @@ FIND
 → EVIDENCE
 → CONTROLLED PROMOTION
 → LEARN
+
+Hermes arbeitet dabei nach der Reihenfolge des `WXK_BUSINESS_COPILOT_GOLDEN_MASTER_EXECUTION_PLAN.md` und springt nur dann, wenn ein Arbeitspaket durch externen Input blockiert ist und ein späteres Paket unabhängig davon belastbar weitergeführt werden kann.
 
 Keine neue Parallelarchitektur.
