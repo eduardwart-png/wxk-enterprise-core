@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from db import get_connection, normalize_role
+from rbac import log_audit
 
 PBKDF2_ITERATIONS = 600_000  # OWASP-Empfehlung 2023+ fuer PBKDF2-SHA256
 SESSION_TTL_HOURS = 12
@@ -50,9 +51,14 @@ def create_tenant(db_path: Path, name: str) -> str:
 
 
 def register_user(db_path: Path, tenant_id: str, email: str, password: str,
-                   role: str = "VIEWER") -> str:
+                   role: str = "VIEWER", account_type: str = "HUMAN") -> str:
     if len(password) < 12:
         raise AuthError("Passwort zu kurz (Mindestlaenge 12 Zeichen, Security Baseline)")
+    # Service Accounts (z.B. Integrations-/Bot-Konten) werden bewusst von
+    # Human Users getrennt (Limit-Matrix 3.1). Default HUMAN -> kein
+    # Verhaltensbruch fuer bestehende Aufrufer.
+    if account_type not in ("HUMAN", "SERVICE"):
+        raise AuthError(f"Ungueltiger account_type: {account_type!r} (erlaubt: HUMAN, SERVICE)")
     # Legacy-Rollennamen (OWNER/ADMIN/...) transparent auf das neue
     # Rollenmodell abbilden, damit Alt-Konsumenten nicht crashen (ADR-001).
     role = normalize_role(role)
@@ -61,9 +67,9 @@ def register_user(db_path: Path, tenant_id: str, email: str, password: str,
     con = get_connection(db_path)
     try:
         con.execute(
-            "INSERT INTO users (user_id, tenant_id, email, password_hash, password_salt) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (user_id, tenant_id, email, pw_hash, salt),
+            "INSERT INTO users (user_id, tenant_id, email, password_hash, password_salt, account_type) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, tenant_id, email, pw_hash, salt, account_type),
         )
         con.execute(
             "INSERT INTO user_roles (user_id, role_name, tenant_id) VALUES (?, ?, ?)",
@@ -145,7 +151,8 @@ def revoke_session(db_path: Path, session_token: str) -> None:
     con.close()
 
 
-def assert_tenant_match(session_ctx: dict, requested_tenant_id: str) -> None:
+def assert_tenant_match(session_ctx: dict, requested_tenant_id: str,
+                         db_path: Path | None = None) -> None:
     """Zentrale Durchsetzungsstelle gegen Cross-Tenant-Zugriff. JEDE
     Datenoperation in einem Produkt MUSS dies vor dem eigentlichen Query
     aufrufen (Master-Spec §10: technisch ausgeschlossen, nicht nur geprueft).
@@ -153,11 +160,32 @@ def assert_tenant_match(session_ctx: dict, requested_tenant_id: str) -> None:
     ADR-001 Entscheidung 1/3: Cross-Tenant-Zugriff ist AUSSCHLIESSLICH ueber
     die Platform-Rolle PLATFORM_ROOT moeglich. Die fruehere Kopplung an
     'OWNER' (heute TENANT_OWNER) ist entfernt -- ein Tenant-Role-Token
-    verleiht NIEMALS mandantenuebergreifende Rechte, unabhaengig vom Rang."""
+    verleiht NIEMALS mandantenuebergreifende Rechte, unabhaengig vom Rang.
+
+    JIT-Pfad (Phase 1.2, nur wenn `db_path` uebergeben wird): kein direkter
+    Tenant-Match und kein PLATFORM_ROOT, ABER ein aktiver JIT-Grant fuer genau
+    diesen Tenant UND diesen User -> Zugriff erlaubt. Jede solche Nutzung
+    erzeugt einen EIGENEN Audit-Eintrag "JIT_ACCESS_USED" (break-glass audit:
+    nicht nur die Erteilung, jede Verwendung ist sichtbar). Ohne gueltigen
+    Grant bleibt der Zugriff blockiert (deny-by-default)."""
     if session_ctx.get("roles") and "PLATFORM_ROOT" in session_ctx["roles"]:
         return  # Nur Plattform-Root darf mandantenuebergreifend (ADR-001)
-    if session_ctx["tenant_id"] != requested_tenant_id:
-        raise TenantIsolationError(
-            f"SEV-0: Session gehoert zu Tenant {session_ctx['tenant_id']}, "
-            f"Zugriff auf Tenant {requested_tenant_id} verweigert"
-        )
+    if session_ctx["tenant_id"] == requested_tenant_id:
+        return
+
+    # Kein direkter Match: JIT-Grant pruefen (nur wenn eine DB verfuegbar ist --
+    # Alt-Aufrufer ohne db_path verhalten sich unveraendert wie zuvor).
+    if db_path is not None:
+        import access_contract  # lazy import, vermeidet Import-Zyklus
+        actor_user_id = session_ctx.get("user_id")
+        if actor_user_id and access_contract.check_jit_access(
+                db_path, actor_user_id, requested_tenant_id):
+            log_audit(db_path, requested_tenant_id, actor=actor_user_id,
+                      action="JIT_ACCESS_USED", entity=requested_tenant_id,
+                      quelle="jit")
+            return
+
+    raise TenantIsolationError(
+        f"SEV-0: Session gehoert zu Tenant {session_ctx['tenant_id']}, "
+        f"Zugriff auf Tenant {requested_tenant_id} verweigert"
+    )
