@@ -43,6 +43,8 @@ Abhängigkeit für alle weiteren Phasen.
 
 ## 2. PHASE 1 — SHARED CORE HARDENING
 
+**Status:** DONE (2026-09-30, PRs #5/#6/#7 in wxk-enterprise-core)
+
 ### Ziele
 - Legacy OWNER-Semantik trennen
 - lokale Pfadannahmen abstrahieren

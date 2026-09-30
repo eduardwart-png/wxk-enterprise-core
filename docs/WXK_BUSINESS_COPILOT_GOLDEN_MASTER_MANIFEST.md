@@ -84,7 +84,30 @@ Jede Änderung benötigt:
 **EXECUTION CANON**
 
 ### Shared Core aktueller Code
-**FOUNDATION — Migration/Erweiterung erforderlich**
+**PHASE 1 (SHARED CORE HARDENING) COMPLETE — Cloud Foundation (Phase 2) offen**
+
+CHANGE_ID: PHASE1-SHARED-CORE-HARDENING-20260930
+Reason: Execution Plan Phase 1 (Role Model Migration, Access Contract,
+Configuration Abstraction, Health Interface) vollständig umgesetzt.
+Evidence: PRs #5/#6/#7 in wxk-enterprise-core, je mit echtem BREAK-Test
+(Regression real in den Produktivcode injiziert, Test fängt sie, Fix
+wiederhergestellt) und Blast-Radius-Test gegen den echten Verbundwerk-
+Konsumenten (164/164 Tests weiterhin grün). Testsuite 45→53→69→79 Tests,
+alle grün, CI grün auf frischem Klon.
+Affected Assets: core/db.py, core/auth.py, core/rbac.py,
+core/access_contract.py (neu), core/health.py, core/health_interface.py
+(neu), core/backup_restore.py.
+Regression Impact: keine — additive Migrationen, Legacy-Rollennamen
+transparent abgebildet, bestehende Konsumenten unverändert kompatibel.
+Rollback/Supersede Path: git revert der PRs #5/#6/#7 in umgekehrter
+Reihenfolge stellt den Vorzustand wieder her (keine destruktiven
+Migrationen, alte Spalten/Rollen bleiben erhalten).
+
+Noch offen (Phase 1 deckt NICHT ab): Cloud Foundation (Phase 2), Canonical
+Data Model (Phase 3) und alle Folgephasen bleiben unverändert offen. Aus
+"Phase 1 complete" darf NICHT abgeleitet werden, dass das Produkt
+produktionsreif ist — Acceptance Matrix §3.1 ist erfüllt, weitergehende
+Kriterien (Cloud Data Plane, Multi-Tenant-SaaS-Betrieb) nicht.
 
 ### Verbundwerk
 **REFERENCE BLUEPRINT COMPLETE — Produktive Implementierung offen**
