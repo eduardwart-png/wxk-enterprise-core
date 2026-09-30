@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from db import get_connection
+from db import get_connection, normalize_role
 
 PBKDF2_ITERATIONS = 600_000  # OWASP-Empfehlung 2023+ fuer PBKDF2-SHA256
 SESSION_TTL_HOURS = 12
@@ -53,6 +53,9 @@ def register_user(db_path: Path, tenant_id: str, email: str, password: str,
                    role: str = "VIEWER") -> str:
     if len(password) < 12:
         raise AuthError("Passwort zu kurz (Mindestlaenge 12 Zeichen, Security Baseline)")
+    # Legacy-Rollennamen (OWNER/ADMIN/...) transparent auf das neue
+    # Rollenmodell abbilden, damit Alt-Konsumenten nicht crashen (ADR-001).
+    role = normalize_role(role)
     pw_hash, salt = _hash_password(password)
     user_id = f"U-{uuid.uuid4().hex[:12]}"
     con = get_connection(db_path)
@@ -145,9 +148,14 @@ def revoke_session(db_path: Path, session_token: str) -> None:
 def assert_tenant_match(session_ctx: dict, requested_tenant_id: str) -> None:
     """Zentrale Durchsetzungsstelle gegen Cross-Tenant-Zugriff. JEDE
     Datenoperation in einem Produkt MUSS dies vor dem eigentlichen Query
-    aufrufen (Master-Spec §10: technisch ausgeschlossen, nicht nur geprueft)."""
-    if session_ctx.get("roles") and "OWNER" in session_ctx["roles"]:
-        return  # Root Admin (nur Eduard) darf mandantenuebergreifend
+    aufrufen (Master-Spec §10: technisch ausgeschlossen, nicht nur geprueft).
+
+    ADR-001 Entscheidung 1/3: Cross-Tenant-Zugriff ist AUSSCHLIESSLICH ueber
+    die Platform-Rolle PLATFORM_ROOT moeglich. Die fruehere Kopplung an
+    'OWNER' (heute TENANT_OWNER) ist entfernt -- ein Tenant-Role-Token
+    verleiht NIEMALS mandantenuebergreifende Rechte, unabhaengig vom Rang."""
+    if session_ctx.get("roles") and "PLATFORM_ROOT" in session_ctx["roles"]:
+        return  # Nur Plattform-Root darf mandantenuebergreifend (ADR-001)
     if session_ctx["tenant_id"] != requested_tenant_id:
         raise TenantIsolationError(
             f"SEV-0: Session gehoert zu Tenant {session_ctx['tenant_id']}, "
