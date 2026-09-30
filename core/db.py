@@ -125,12 +125,57 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status ON jobs(tenant_id, status);
 
+-- Legacy-Rollen (ADR-001 "LEGACY_FOUNDATION_ONLY"): NICHT loeschen, sonst
+-- brechen FKs bestehender user_roles-Zeilen und Alt-Konsumenten. Neue Rollen
+-- werden rein additiv per INSERT OR IGNORE ergaenzt (kein Rebuild).
 INSERT OR IGNORE INTO roles (role_name, beschreibung) VALUES
-    ('OWNER', 'Voller Zugriff, alle Mandanten (nur Eduard, Root Admin)'),
-    ('ADMIN', 'Voller Zugriff innerhalb des eigenen Mandanten'),
-    ('REVIEWER', 'Kann Review-Faelle bearbeiten, keine Admin-Rechte'),
-    ('VIEWER', 'Nur Lesezugriff innerhalb des eigenen Mandanten');
+    ('OWNER', 'LEGACY (ADR-001): historisch mandantenuebergreifend -- wird jetzt auf TENANT_OWNER abgebildet, KEIN Cross-Tenant-Bypass mehr'),
+    ('ADMIN', 'LEGACY (ADR-001): wird auf TENANT_ADMIN abgebildet'),
+    ('REVIEWER', 'LEGACY (ADR-001): wird auf TENANT_REVIEWER abgebildet'),
+    ('VIEWER', 'LEGACY (ADR-001): wird auf TENANT_VIEWER abgebildet');
+
+-- Platform-Ebene (global, NICHT an einen Mandanten gebunden). Nur diese
+-- Ebene darf ueberhaupt mandantenuebergreifend agieren (ADR-001 Entsch. 1).
+INSERT OR IGNORE INTO roles (role_name, beschreibung) VALUES
+    ('PLATFORM_ROOT', 'Plattform-Root: einzige Rolle mit Cross-Tenant-Bypass (assert_tenant_match)'),
+    ('PLATFORM_ADMIN', 'Plattform-Administration ohne automatischen Tenant-Dateninhalt'),
+    ('PLATFORM_SUPPORT', 'Plattform-Support: kein automatischer Tenant-Dateneinblick (JIT-Grant noetig)'),
+    ('PLATFORM_AUDITOR', 'Plattform-Audit: niedrigster Platform-Rang, nur Metadaten/Audit');
+
+-- Tenant-Ebene (strikt auf genau EINEN Mandanten beschraenkt, NIEMALS
+-- Cross-Tenant, unabhaengig vom Rang -- ADR-001 "TENANT_OWNER ist niemals
+-- PLATFORM_ROOT").
+INSERT OR IGNORE INTO roles (role_name, beschreibung) VALUES
+    ('TENANT_OWNER', 'Voller Admin-Zugriff INNERHALB genau eines Mandanten (kein Cross-Tenant)'),
+    ('TENANT_ADMIN', 'Administration innerhalb des eigenen Mandanten'),
+    ('TENANT_REVIEWER', 'Bearbeitet Review-Faelle im eigenen Mandanten'),
+    ('TENANT_OPERATOR', 'Operativer Bearbeiter im eigenen Mandanten'),
+    ('TENANT_FINANCE', 'Finanz-/Abrechnungsrolle im eigenen Mandanten'),
+    ('TENANT_SALES', 'Vertriebsrolle im eigenen Mandanten'),
+    ('TENANT_VIEWER', 'Nur Lesezugriff innerhalb des eigenen Mandanten');
 """
+
+# Legacy-Rollennamen -> neue Tenant-Rollen (ADR-001 Entscheidung 3).
+# Bewusste Verhaltensaenderung: Legacy 'OWNER' wird tenant-scoped
+# (TENANT_OWNER) und verliert damit den Cross-Tenant-Bypass, den er nie
+# haette haben duerfen (ADR-001: "Kein externer Kunde darf die heutige
+# mandantenuebergreifende OWNER-Semantik erhalten"). Der Cross-Tenant-Pfad
+# ist ab jetzt ausschliesslich PLATFORM_ROOT vorbehalten.
+LEGACY_ROLE_MAP = {
+    "OWNER": "TENANT_OWNER",
+    "ADMIN": "TENANT_ADMIN",
+    "REVIEWER": "TENANT_REVIEWER",
+    "VIEWER": "TENANT_VIEWER",
+}
+
+
+def normalize_role(role: str) -> str:
+    """Bildet einen Legacy-Rollennamen transparent auf die neue Rolle ab.
+    Neue Rollennamen (PLATFORM_*/TENANT_*) bleiben unveraendert. Zentrale
+    Stelle, damit Alt-Konsumenten (crm_api.py, WXK-Workbench) mit
+    role='OWNER' NICHT crashen, aber die korrekte tenant-scoped Semantik
+    bekommen."""
+    return LEGACY_ROLE_MAP.get(role, role)
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
