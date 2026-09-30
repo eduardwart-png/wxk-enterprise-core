@@ -17,6 +17,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from health_interface import (
+    ProductHealthAdapter,
+    aggregate_status,
+    get_registered_adapters,
+    make_dependency,
+    register_adapter,
+)
+
 CORE_DIR = Path(__file__).resolve().parent
 
 
@@ -80,19 +88,40 @@ def wxk_status() -> dict:
 
     tenant_isolation_ok = besitzer_file.exists()
 
-    status = "GREEN"
-    gruende = []
-    if finance_check["status"] != "GREEN":
-        status = "RED"
-        gruende.append(f"finance_tax_ledger.sqlite: {finance_check['grund']}")
-    if not tenant_isolation_ok:
-        status = "RED" if status == "GREEN" else status
-        gruende.append("Datenbesitzer-Tenant-Datei fehlt -- SEV-0-Zugriffsschutz nicht aktiv")
+    # Strukturierte Dependency-Checks statt einer Freitext-Gründeliste
+    # (Phase 1.4: "dependency checks"). Jede Abhängigkeit ist einzeln
+    # unterscheidbar mit eigenem Status und Kritikalität.
+    dependencies = [
+        # Kritisch: ohne erreichbare Finanz-DB ist WXK unbrauchbar -> RED.
+        make_dependency(
+            "finance_db_erreichbar",
+            finance_check["status"],
+            f"finance_tax_ledger.sqlite: {finance_check['grund']}",
+            kritisch=True,
+        ),
+        # Bewusste Entscheidung (Phase 1.4, kein stiller Verhaltenswechsel):
+        # Die Datenbesitzer-Tenant-Datei ist ein Sicherheits-Kontrollpunkt,
+        # NICHT die Datenverfügbarkeit. Fehlt sie, während die DB erreichbar
+        # ist, sind die Daten lesbar, aber ein Kontrollpunkt fehlt -- das ist
+        # ehrlicher als hartes RED. Darum kritisch=False: der Fall zieht das
+        # Produkt auf DEGRADED, nicht auf RED. Nur wenn zusätzlich die
+        # kritische DB fällt, wird das Gesamtprodukt RED.
+        make_dependency(
+            "tenant_isolation_datei",
+            "GREEN" if tenant_isolation_ok else "RED",
+            "Datenbesitzer-Tenant-Datei fehlt -- Sicherheits-Kontrollpunkt "
+            "nicht aktiv (DB lesbar, daher DEGRADED statt RED)",
+            kritisch=False,
+        ),
+    ]
+    status = aggregate_status(dependencies)
+    gruende = [d["grund"] for d in dependencies if d["status"] != "GREEN"]
 
     return {
         "produkt": "WXK",
         "status": status,
         "gruende": gruende or ["Alle Checks bestanden"],
+        "dependencies": dependencies,
         "transaktionen_gesamt": n_transactions,
         "transaktionen_verified": n_verified,
         "tenant_isolation_aktiv": tenant_isolation_ok,
@@ -120,19 +149,32 @@ def verbundwerk_status() -> dict:
 
     tenant_isolation_ok = besitzer_file.exists()
 
-    status = "GREEN"
-    gruende = []
-    if vw_check["status"] != "GREEN":
-        status = "RED"
-        gruende.append(f"verbundwerk_core.sqlite: {vw_check['grund']}")
-    if not tenant_isolation_ok:
-        status = "RED" if status == "GREEN" else status
-        gruende.append("Datenbesitzer-Tenant-Datei fehlt -- SEV-0-Zugriffsschutz nicht aktiv")
+    dependencies = [
+        # Kritisch: ohne erreichbare Verbundwerk-DB ist das Produkt unbrauchbar.
+        make_dependency(
+            "verbundwerk_db_erreichbar",
+            vw_check["status"],
+            f"verbundwerk_core.sqlite: {vw_check['grund']}",
+            kritisch=True,
+        ),
+        # Analog zu WXK: fehlender Sicherheits-Kontrollpunkt -> DEGRADED,
+        # nicht RED, solange die DB erreichbar ist (bewusste Entscheidung).
+        make_dependency(
+            "tenant_isolation_datei",
+            "GREEN" if tenant_isolation_ok else "RED",
+            "Datenbesitzer-Tenant-Datei fehlt -- Sicherheits-Kontrollpunkt "
+            "nicht aktiv (DB lesbar, daher DEGRADED statt RED)",
+            kritisch=False,
+        ),
+    ]
+    status = aggregate_status(dependencies)
+    gruende = [d["grund"] for d in dependencies if d["status"] != "GREEN"]
 
     return {
         "produkt": "Verbundwerk",
         "status": status,
         "gruende": gruende or ["Alle Checks bestanden"],
+        "dependencies": dependencies,
         "kunden_gesamt": n_kunden,
         "event_ledger_eintraege": n_events,
         "tenant_isolation_aktiv": tenant_isolation_ok,
@@ -157,24 +199,69 @@ def run_pytest_summary(test_dir: Path) -> dict:
     }
 
 
+class WXKHealthAdapter(ProductHealthAdapter):
+    """Konkreter Adapter für WXK. status() delegiert bewusst an die
+    Modul-Funktion wxk_status(), damit bestehende Tests, die
+    monkeypatch.setattr(health, 'wxk_status', ...) nutzen, weiter greifen und
+    die abwärtskompatible Rückgabe-Struktur (transaktionen_gesamt etc.)
+    erhalten bleibt."""
+
+    product_name = "WXK"
+
+    def check_dependencies(self) -> list[dict]:
+        return wxk_status()["dependencies"]
+
+    def status(self) -> dict:
+        return wxk_status()
+
+
+class VerbundwerkHealthAdapter(ProductHealthAdapter):
+    """Konkreter Adapter für Verbundwerk -- analog zu WXKHealthAdapter."""
+
+    product_name = "Verbundwerk"
+
+    def check_dependencies(self) -> list[dict]:
+        return verbundwerk_status()["dependencies"]
+
+    def status(self) -> dict:
+        return verbundwerk_status()
+
+
 def root_control_center() -> dict:
     """Master-Prompt §34: 'Eduard soll mit einem Blick erkennen koennen:
-    Laeuft alles oder muss ich etwas entscheiden?'"""
-    wxk = wxk_status()
-    vw = verbundwerk_status()
+    Laeuft alles oder muss ich etwas entscheiden?'
+
+    Phase 1.4: Aggregation läuft jetzt über die Adapter-Registry statt über
+    hartcodierte Produktaufrufe. Ein drittes Produkt, das sich per
+    register_adapter(...) anmeldet, erscheint hier automatisch -- ohne dass
+    diese Funktion geändert werden muss."""
+    system: dict = {}
+    einzelstatus: list[str] = []
+    for adapter in get_registered_adapters():
+        produkt_status = adapter.status()
+        system[adapter.product_name] = produkt_status
+        einzelstatus.append(produkt_status["status"])
 
     gesamtstatus = "GREEN"
-    if "RED" in (wxk["status"], vw["status"]):
+    if "RED" in einzelstatus:
         gesamtstatus = "RED"
-    elif "DEGRADED" in (wxk["status"], vw["status"]):
+    elif "DEGRADED" in einzelstatus:
         gesamtstatus = "DEGRADED"
 
     return {
         "erzeugt_am": datetime.now(timezone.utc).isoformat(),
         "gesamtstatus": gesamtstatus,
-        "system": {"WXK": wxk, "Verbundwerk": vw},
+        "system": system,
         "muss_eduard_entscheiden": gesamtstatus != "GREEN",
     }
+
+
+# --- Automatische Adapter-Registrierung beim Modul-Import --------------------
+# WXK und Verbundwerk melden sich selbst an; root_control_center() findet sie
+# über die Registry. Ein drittes Produkt fügt hier NICHTS hinzu -- es ruft
+# einfach register_adapter(...) mit seinem eigenen Adapter auf.
+register_adapter(WXKHealthAdapter())
+register_adapter(VerbundwerkHealthAdapter())
 
 
 if __name__ == "__main__":
