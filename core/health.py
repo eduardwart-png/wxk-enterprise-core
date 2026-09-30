@@ -10,6 +10,7 @@ Dateisystem-Check, Testlauf-Ergebnis).
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -17,8 +18,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CORE_DIR = Path(__file__).resolve().parent
-WXK_DIR = Path.home() / "OneDrive" / "Desktop" / "Steuererklärung" / "Steuervorbereitung" / "_SYSTEM"
-VW_DIR = Path.home() / "OneDrive" / "Desktop" / "Verbundwerk_Deutschland_Vertriebsaufbau"
+
+
+def _resolve_wxk_dir() -> Path:
+    """Root-Cause-Fix (30.09.2026): Pfad war hartcodiert auf einen Ordner
+    ohne ENV-Override -- Golden Master Execution Plan Phase 1.3
+    ('Configuration Abstraction: Local Path -> Config/Registry, keine
+    Nutzerpfade als Produktionsannahme'). ENV-Override analog zu
+    backup_restore.WXK_CORE_DB_PATH."""
+    override = os.environ.get("WXK_SYSTEM_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / "OneDrive" / "Desktop" / "Steuererklärung" / "Steuervorbereitung" / "_SYSTEM"
+
+
+def _resolve_vw_dir() -> Path:
+    """Root-Cause-Fund (30.09.2026): dieser Pfad zeigte auf
+    ~/OneDrive/Desktop/Verbundwerk_Deutschland_Vertriebsaufbau, das nach dem
+    Umzug ins Projekte-Mac-Schema NIE existiert hat -- verbundwerk_status()
+    meldete deshalb IMMER RED, unabhaengig vom echten Systemzustand (durch
+    echten Lauf am 30.09.2026 bestaetigt: GESAMTSTATUS RED trotz 164/164
+    gruener Tests im echten Projekt). ENV-Override + korrigierter Default."""
+    override = os.environ.get("VERBUNDWERK_PROJECT_DIR")
+    if override:
+        return Path(override)
+    return (Path.home() / "Projekte-Mac" /
+            "OneDrive__Desktop__Verbundwerk_Deutschland_Vertriebsaufbau")
+
+
+WXK_DIR = _resolve_wxk_dir()
+VW_DIR = _resolve_vw_dir()
 
 
 def _sqlite_healthcheck(db_path: Path) -> dict:
