@@ -106,6 +106,28 @@ CREATE TABLE IF NOT EXISTS portal_links (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_links_tenant ON portal_links(tenant_id);
 
+-- Just-in-Time-Grants (ADR-001: Support-Zugriff ist "scope-/zeitbegrenzt und
+-- auditpflichtig"). Platform-Support hat KEINEN automatischen
+-- Tenant-Dateneinblick (siehe Rollenbeschreibung PLATFORM_SUPPORT) -- ein
+-- temporaerer, auf GENAU EINEN Tenant und GENAU EINEN User begrenzter Grant
+-- ist der einzige Weg. Analog zu portal_links (zeitlich begrenzt,
+-- widerrufbar), aber gebunden an user_id statt an einen erratbaren Token:
+-- der Grant autorisiert einen konkreten Support-Mitarbeiter, nicht den
+-- Besitz eines Geheimnisses. `reason` ist NOT NULL (kein Grant ohne
+-- dokumentierten Anlass -- Break-Glass-Pflicht).
+CREATE TABLE IF NOT EXISTS jit_grants (
+    grant_id        TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(tenant_id),
+    user_id         TEXT NOT NULL,  -- Support-Mitarbeiter (Platform-Ebene, evtl. anderer tenant_id)
+    reason          TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at      TEXT NOT NULL,
+    revoked         INTEGER NOT NULL DEFAULT 0,
+    revoked_by      TEXT,
+    revoked_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jit_grants_lookup ON jit_grants(tenant_id, user_id, revoked);
+
 -- Background Jobs / Queue (Master-Prompt §35/§36, Continuation-Order §5:
 -- Retry, Backoff, Dead Letter Queue, Idempotency als Shared-Core-Pflicht)
 CREATE TABLE IF NOT EXISTS jobs (
@@ -184,8 +206,27 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     return con
 
 
+def _add_column_if_missing(con: sqlite3.Connection, table: str, column: str,
+                            definition: str) -> None:
+    """Additive Migration: fuegt eine Spalte nur hinzu, wenn sie noch fehlt.
+    SQLite kennt kein `ADD COLUMN IF NOT EXISTS`, daher Vorpruefung ueber
+    PRAGMA table_info -- so bleibt mehrfacher init_schema-Aufruf auf derselben
+    DB idempotent (kein doppeltes ADD COLUMN -> kein OperationalError)."""
+    vorhandene = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    if column not in vorhandene:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
 def init_schema(db_path: Path) -> None:
     con = get_connection(db_path)
     con.executescript(SCHEMA)
+    # Additive Migration (ADR-001 / Limit-Matrix 3.1): Service Accounts von
+    # Human Users trennen. CHECK-Constraint erzwingt gueltige Werte, Default
+    # 'HUMAN' bricht keine bestehende Zeile.
+    _add_column_if_missing(
+        con, "users", "account_type",
+        "account_type TEXT NOT NULL DEFAULT 'HUMAN' "
+        "CHECK (account_type IN ('HUMAN', 'SERVICE'))",
+    )
     con.commit()
     con.close()
