@@ -33,11 +33,29 @@ def _resolve_wxk_dir() -> Path:
     ohne ENV-Override -- Golden Master Execution Plan Phase 1.3
     ('Configuration Abstraction: Local Path -> Config/Registry, keine
     Nutzerpfade als Produktionsannahme'). ENV-Override analog zu
-    backup_restore.WXK_CORE_DB_PATH."""
+    backup_restore.WXK_CORE_DB_PATH. Gilt weiterhin fuer wxk_core.sqlite
+    und wxk_datenbesitzer_tenant.txt -- NICHT fuer finance_tax_ledger.sqlite,
+    siehe _resolve_finance_ledger_path() (DEC-20260930-01 Migration weg von
+    der falschen OneDrive-Pfad-Annahme)."""
     override = os.environ.get("WXK_SYSTEM_DIR")
     if override:
         return Path(override)
     return Path.home() / "OneDrive" / "Desktop" / "Steuererklärung" / "Steuervorbereitung" / "_SYSTEM"
+
+
+def _resolve_finance_ledger_path() -> Path:
+    """DEC-20260930-01 Migration (30.09.2026): finance_tax_ledger.sqlite lag
+    zuvor unter WXK_DIR (~/OneDrive/Desktop/...), obwohl auf diesem Mac kein
+    echter OneDrive-Client installiert ist -- der Pfad war nur ein
+    zufaelliger lokaler Ordner gleichen Namens, keine echte Cloud-Anbindung.
+    Eigener ENV-Override (FINANCE_TAX_LEDGER_PATH), damit die Finanz-DB
+    unabhaengig vom WXK_SYSTEM_DIR-Pfad auf einem stabilen, nicht
+    cloud-suggerierenden lokalen Systempfad liegen kann. Kanonischer
+    Default: ~/Projekte-Mac/_DATA/WXK_TAX/finance_tax_ledger.sqlite."""
+    override = os.environ.get("FINANCE_TAX_LEDGER_PATH")
+    if override:
+        return Path(override)
+    return Path.home() / "Projekte-Mac" / "_DATA" / "WXK_TAX" / "finance_tax_ledger.sqlite"
 
 
 def _resolve_vw_dir() -> Path:
@@ -55,6 +73,7 @@ def _resolve_vw_dir() -> Path:
 
 
 WXK_DIR = _resolve_wxk_dir()
+FINANCE_DB_PATH = _resolve_finance_ledger_path()
 VW_DIR = _resolve_vw_dir()
 
 
@@ -72,8 +91,7 @@ def _sqlite_healthcheck(db_path: Path) -> dict:
 
 def wxk_status() -> dict:
     core_db = WXK_DIR / "wxk_core.sqlite"
-    finance_db = WXK_DIR / "finance_tax_ledger.sqlite"
-    besitzer_file = WXK_DIR / "wxk_datenbesitzer_tenant.txt"
+    finance_db = FINANCE_DB_PATH
 
     finance_check = _sqlite_healthcheck(finance_db)
     core_check = _sqlite_healthcheck(core_db)
@@ -86,7 +104,26 @@ def wxk_status() -> dict:
         n_verified = con.execute("SELECT COUNT(*) FROM transactions WHERE review_status='VERIFIED'").fetchone()[0]
         con.close()
 
-    tenant_isolation_ok = besitzer_file.exists()
+    # Root-Cause-Fix (30.09.2026, DEC-20260930-01 TEIL 5/6): vorher wurde
+    # nur geprueft, ob eine separate Datei wxk_datenbesitzer_tenant.txt
+    # existiert -- diese Datei wurde NIE erzeugt und war ein reiner
+    # Datei-Existenz-Marker ohne eigenen Informationsgehalt (eine zweite,
+    # redundante SSOT waere gewesen, sie kuenstlich anzulegen). Die echte
+    # kanonische Tenant-Ownership-Information existiert bereits in
+    # wxk_core.sqlite (Tabelle `tenants`, Status ACTIVE) -- der Check liest
+    # jetzt DIREKT aus der echten Quelle, keine Dummy-Datei mehr noetig.
+    tenant_isolation_ok = False
+    tenant_name = None
+    if core_check["status"] == "GREEN":
+        con = sqlite3.connect(core_db)
+        row = con.execute(
+            "SELECT tenant_id, name FROM tenants WHERE status='ACTIVE' "
+            "AND name LIKE '%Eduard%' LIMIT 1"
+        ).fetchone()
+        con.close()
+        if row:
+            tenant_isolation_ok = True
+            tenant_name = row[1]
 
     # Strukturierte Dependency-Checks statt einer Freitext-Gründeliste
     # (Phase 1.4: "dependency checks"). Jede Abhängigkeit ist einzeln
@@ -100,17 +137,20 @@ def wxk_status() -> dict:
             kritisch=True,
         ),
         # Bewusste Entscheidung (Phase 1.4, kein stiller Verhaltenswechsel):
-        # Die Datenbesitzer-Tenant-Datei ist ein Sicherheits-Kontrollpunkt,
-        # NICHT die Datenverfügbarkeit. Fehlt sie, während die DB erreichbar
-        # ist, sind die Daten lesbar, aber ein Kontrollpunkt fehlt -- das ist
-        # ehrlicher als hartes RED. Darum kritisch=False: der Fall zieht das
-        # Produkt auf DEGRADED, nicht auf RED. Nur wenn zusätzlich die
-        # kritische DB fällt, wird das Gesamtprodukt RED.
+        # Die Tenant-Ownership ist ein Sicherheits-Kontrollpunkt, NICHT die
+        # Datenverfügbarkeit. Fehlt der ACTIVE-Tenant-Eintrag, während die
+        # Finanz-DB erreichbar ist, sind die Daten lesbar, aber ein
+        # Kontrollpunkt fehlt -- das ist ehrlicher als hartes RED. Darum
+        # kritisch=False: der Fall zieht das Produkt auf DEGRADED, nicht
+        # auf RED. Nur wenn zusätzlich die kritische DB fällt, wird das
+        # Gesamtprodukt RED.
         make_dependency(
             "tenant_isolation_datei",
             "GREEN" if tenant_isolation_ok else "RED",
-            "Datenbesitzer-Tenant-Datei fehlt -- Sicherheits-Kontrollpunkt "
-            "nicht aktiv (DB lesbar, daher DEGRADED statt RED)",
+            (f"Tenant-Ownership aktiv: {tenant_name}" if tenant_isolation_ok
+             else "Kein ACTIVE-Tenant-Eintrag fuer Eduard in wxk_core.sqlite "
+                  "gefunden -- Sicherheits-Kontrollpunkt nicht aktiv "
+                  "(DB lesbar, daher DEGRADED statt RED)"),
             kritisch=False,
         ),
     ]

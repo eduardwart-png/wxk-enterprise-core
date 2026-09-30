@@ -36,12 +36,45 @@ def test_gesamtstatus_gruen_nur_wenn_beide_gruen(monkeypatch):
 
 
 def test_fehlende_db_wird_als_red_erkannt(tmp_path, monkeypatch):
-    """BREAK-artiger Test: nicht-existente Datenbank muss RED liefern,
-    nicht stillschweigend als OK durchgehen."""
-    monkeypatch.setattr(health, "WXK_DIR", tmp_path / "nicht_existent")
+    """BREAK-artiger Test: nicht-existente Finanz-Datenbank muss RED liefern,
+    nicht stillschweigend als OK durchgehen. Seit DEC-20260930-01 (30.09.2026)
+    ist FINANCE_DB_PATH unabhaengig von WXK_DIR (Entkopplung vom frueheren
+    OneDrive-Scheinpfad) -- der Test patcht deshalb gezielt FINANCE_DB_PATH,
+    nicht mehr WXK_DIR."""
+    monkeypatch.setattr(health, "FINANCE_DB_PATH", tmp_path / "nicht_existent" / "finance_tax_ledger.sqlite")
     status = health.wxk_status()
     assert status["status"] == "RED"
     assert any("fehlt" in g.lower() for g in status["gruende"])
+
+
+def test_tenant_ownership_liest_aus_wxk_core_nicht_aus_dummy_datei(tmp_path, monkeypatch):
+    """Root-Cause-Fix (DEC-20260930-01 TEIL 5/6, 30.09.2026): der
+    Tenant-Kontrollpunkt darf NICHT von einer separaten, nie erzeugten
+    Datei (wxk_datenbesitzer_tenant.txt) abhaengen -- das waere entweder
+    dauerhaft RED oder eine kuenstliche Dummy-Datei (verboten). Stattdessen
+    liest er direkt aus der echten SSOT (wxk_core.sqlite Tabelle `tenants`).
+    Test baut eine isolierte core_db ohne ACTIVE-Eduard-Tenant und prueft,
+    dass der Kontrollpunkt dann korrekt RED meldet (DEGRADED, nicht GREEN)."""
+    import sqlite3
+    core_db = tmp_path / "wxk_core.sqlite"
+    con = sqlite3.connect(core_db)
+    con.execute("CREATE TABLE tenants (tenant_id TEXT, name TEXT, status TEXT)")
+    con.execute("INSERT INTO tenants VALUES ('T-fremd', 'Fremdmandant GmbH', 'ACTIVE')")
+    con.commit()
+    con.close()
+
+    finance_db = tmp_path / "finance_tax_ledger.sqlite"
+    con2 = sqlite3.connect(finance_db)
+    con2.execute("CREATE TABLE transactions (review_status TEXT)")
+    con2.commit()
+    con2.close()
+
+    monkeypatch.setattr(health, "WXK_DIR", tmp_path)
+    monkeypatch.setattr(health, "FINANCE_DB_PATH", finance_db)
+    status = health.wxk_status()
+    assert status["dependencies"][1]["status"] == "RED"
+    assert status["status"] == "DEGRADED"
+    assert status["tenant_isolation_aktiv"] is False
 
 
 if __name__ == "__main__":

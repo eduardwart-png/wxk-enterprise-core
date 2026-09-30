@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import health
 
-WXK_DB = health.WXK_DIR / "finance_tax_ledger.sqlite"
+WXK_DB = health.FINANCE_DB_PATH
 
 
 def product_readiness(produkt: str) -> dict:
