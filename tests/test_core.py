@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 
 import pytest
 from db import init_schema
+from auth import session_digest, migrate_plaintext_sessions  # noqa: E402
 from auth import (
     create_tenant, register_user, login, verify_session, revoke_session,
     assert_tenant_match, AuthError, TenantIsolationError,
@@ -332,7 +333,7 @@ def test_abgelaufene_session_wird_abgelehnt(db, monkeypatch):
     token = login(db, tid, "user@t1.de", "passwort-1234567890")
 
     con = sqlite3.connect(db)
-    con.execute("UPDATE sessions SET expires_at = '2020-01-01T00:00:00+00:00' WHERE session_token = ?", (token,))
+    con.execute("UPDATE sessions SET expires_at = '2020-01-01T00:00:00+00:00' WHERE session_token = ?", (session_digest(token),))
     con.commit()
     con.close()
 
@@ -355,3 +356,37 @@ def test_gleiche_email_in_verschiedenen_tenants_erlaubt(db):
     register_user(db, tenant_a, "shared@example.de", "passwort-1234567890")
     uid_b = register_user(db, tenant_b, "shared@example.de", "anderes-passwort-999")
     assert uid_b.startswith("U-")
+
+
+# ---- NO_PLAINTEXT_REUSABLE_CREDENTIAL_IN_TRACKED_DB (Fix 03.10.2026) ----
+def _db_mit_nutzer(tmp_path):
+    db = tmp_path / "core.sqlite"
+    init_schema(db)
+    tid = create_tenant(db, "T")
+    register_user(db, tid, "a@t.local", "geheim-test-123")
+    return db, tid
+
+
+def test_session_schluessel_nur_als_hash(tmp_path):
+    import sqlite3
+    db, tid = _db_mit_nutzer(tmp_path)
+    tok = login(db, tid, "a@t.local", "geheim-test-123")
+    gespeichert = [r[0] for r in sqlite3.connect(db).execute("SELECT session_token FROM sessions")]
+    assert tok not in gespeichert and gespeichert == [session_digest(tok)]
+    assert verify_session(db, tok)["tenant_id"] == tid
+    with pytest.raises(AuthError):
+        verify_session(db, session_digest(tok))      # gestohlener DB-Wert taugt NICHT als Schluessel
+    revoke_session(db, tok)
+    with pytest.raises(AuthError):
+        verify_session(db, tok)
+
+
+def test_alt_klartext_sitzung_wird_migriert_und_bleibt_gueltig(tmp_path):
+    import sqlite3
+    db, tid = _db_mit_nutzer(tmp_path)
+    tok = login(db, tid, "a@t.local", "geheim-test-123")
+    con = sqlite3.connect(db)
+    con.execute("UPDATE sessions SET session_token = ?", (tok,)); con.commit()   # Altbestand simulieren
+    assert verify_session(db, tok)["tenant_id"] == tid
+    assert [r[0] for r in con.execute("SELECT session_token FROM sessions")] == [session_digest(tok)]
+    assert migrate_plaintext_sessions(sqlite3.connect(db)) == 0                  # idempotent

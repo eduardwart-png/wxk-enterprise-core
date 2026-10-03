@@ -25,6 +25,26 @@ PBKDF2_ITERATIONS = 600_000  # OWASP-Empfehlung 2023+ fuer PBKDF2-SHA256
 SESSION_TTL_HOURS = 12
 
 
+SESSION_DIGEST_PREFIX = "sha256:"
+
+
+def session_digest(session_token: str) -> str:
+    """Sitzungsschluessel nur als Hash speichern (Fix 03.10.2026: Klartext-Schluessel lagen in einer
+    versionierten DB). Der Client behaelt den Rohschluessel; die DB kennt ihn nicht."""
+    return SESSION_DIGEST_PREFIX + hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+
+
+def migrate_plaintext_sessions(con) -> int:
+    """Alt-Zeilen mit Klartext-Schluessel in place hashen (idempotent; laufende Sitzungen bleiben gueltig)."""
+    rows = con.execute("SELECT session_token FROM sessions WHERE session_token NOT LIKE ?",
+                       (SESSION_DIGEST_PREFIX + "%",)).fetchall()
+    for (tok,) in rows:
+        con.execute("UPDATE sessions SET session_token = ? WHERE session_token = ?", (session_digest(tok), tok))
+    if rows:
+        con.commit()
+    return len(rows)
+
+
 class AuthError(Exception):
     pass
 
@@ -108,9 +128,10 @@ def login(db_path: Path, tenant_id: str, email: str, password: str) -> str:
 
     token = secrets.token_hex(32)
     expires = (datetime.now(timezone.utc) + timedelta(hours=SESSION_TTL_HOURS)).isoformat()
+    migrate_plaintext_sessions(con)
     con.execute(
         "INSERT INTO sessions (session_token, user_id, tenant_id, expires_at) VALUES (?, ?, ?, ?)",
-        (token, user_id, tenant_id, expires),
+        (session_digest(token), user_id, tenant_id, expires),
     )
     con.commit()
     con.close()
@@ -121,9 +142,10 @@ def verify_session(db_path: Path, session_token: str) -> dict:
     """Prueft ein Session-Token und gibt {user_id, tenant_id, roles} zurueck.
     Wirft AuthError bei abgelaufener/widerrufener/unbekannter Session."""
     con = get_connection(db_path)
+    migrate_plaintext_sessions(con)
     row = con.execute(
         "SELECT user_id, tenant_id, expires_at, revoked FROM sessions WHERE session_token = ?",
-        (session_token,),
+        (session_digest(session_token),),
     ).fetchone()
     if row is None:
         con.close()
@@ -146,7 +168,8 @@ def verify_session(db_path: Path, session_token: str) -> dict:
 
 def revoke_session(db_path: Path, session_token: str) -> None:
     con = get_connection(db_path)
-    con.execute("UPDATE sessions SET revoked = 1 WHERE session_token = ?", (session_token,))
+    migrate_plaintext_sessions(con)
+    con.execute("UPDATE sessions SET revoked = 1 WHERE session_token = ?", (session_digest(session_token),))
     con.commit()
     con.close()
 
