@@ -244,11 +244,21 @@ def finish_secure_rewrite(con: sqlite3.Connection) -> None:
     OperationalError. Die Migration ist dann schon committet (Spalte gehasht,
     Links/Sitzungen gelten weiter); es bleibt nur der Rest in der Datei. Dann
     eine RuntimeWarning statt eines Abbruchs der Anmeldung: Abhilfe ist ein
-    manuelles VACUUM ohne parallele Zugriffe."""
+    manuelles VACUUM ohne parallele Zugriffe. Gleiche Warnung, wenn im
+    WAL-Modus ein Leser den Checkpoint blockiert (busy-Rueckgabe)."""
     try:
         con.execute("VACUUM")
         if str(con.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Ein offener Leser blockiert den Checkpoint OHNE Ausnahme: die
+            # erste Ergebnisspalte (busy) ist dann ungleich 0.
+            busy = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+            if busy:
+                warnings.warn(
+                    "Klartext-Altwerte migriert, aber WAL-Checkpoint nicht vollstaendig "
+                    "(andere Verbindung liest); Reste koennen bis zum naechsten Checkpoint "
+                    "in Hauptdatei und WAL stehen",
+                    RuntimeWarning, stacklevel=2,
+                )
     except sqlite3.OperationalError as fehler:
         warnings.warn(
             f"Klartext-Altwerte migriert, aber VACUUM nicht moeglich ({fehler}); "

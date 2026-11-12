@@ -649,3 +649,137 @@ def test_r2_ungueltige_ttl_liefert_access_contract_error(db, ttl):
     _heim, ziel, _root_id, sup = _support(db)
     with pytest.raises(AccessContractError):
         grant_jit_access(db, ziel, sup, reason="Vorgang 9", ttl_minutes=ttl)
+
+
+# ------------------------------------------ Runde 2 der Pruefung (L1/L2) ---
+# Alle Faelle ohne Uhrzeitmessung; fremde Sperren werden deterministisch
+# gesetzt, busy_timeout nur auf der Testverbindung klein (kein langes Warten).
+
+import warnings  # noqa: E402
+
+from auth import migrate_plaintext_sessions  # noqa: E402
+from portal_links import migrate_plaintext_portal_links  # noqa: E402
+
+
+def _schnelle_verbindung(path):
+    con = get_connection(path)
+    con.execute("PRAGMA busy_timeout = 50")
+    return con
+
+
+def _offener_leser(path):
+    leser = sqlite3.connect(path, isolation_level=None)
+    leser.execute("BEGIN")
+    leser.execute("SELECT COUNT(*) FROM tenants").fetchone()
+    return leser
+
+
+def _keine_warnung(fn):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        ergebnis = fn()
+    assert [x for x in w if issubclass(x.category, RuntimeWarning)] == []
+    return ergebnis
+
+
+KLARTEXTE = [f"ALTBESTANDPLATZHALTER{i:02d}" + "q" * 24 for i in range(30)]
+
+
+def test_l1_wal_checkpoint_blockiert_durch_leser_warnt(tmp_path):
+    path = tmp_path / "wal_leser.sqlite"
+    _klartext_portal_db(path, KLARTEXTE, wal=True)
+    leser = _offener_leser(path)
+    con = _schnelle_verbindung(path)
+    try:
+        with pytest.warns(RuntimeWarning, match="Checkpoint"):
+            assert migrate_plaintext_portal_links(con) == len(KLARTEXTE)
+    finally:
+        con.close()
+        leser.execute("ROLLBACK")
+        leser.close()
+    assert verify_portal_link(path, KLARTEXTE[0])["client_id"] == "K-0"
+
+
+def test_l2d_wal_checkpoint_nach_migration_leert_wal(tmp_path):
+    path = tmp_path / "wal_ohne_leser.sqlite"
+    _klartext_portal_db(path, KLARTEXTE, wal=True)
+    con = _schnelle_verbindung(path)  # bleibt offen: kein Auto-Checkpoint beim Schliessen
+    try:
+        assert _keine_warnung(lambda: migrate_plaintext_portal_links(con)) == len(KLARTEXTE)
+        wal = Path(str(path) + "-wal")
+        assert not wal.exists() or wal.stat().st_size == 0
+        haupt = path.read_bytes()
+        assert not any(t.encode() in haupt for t in KLARTEXTE)
+    finally:
+        con.close()
+
+
+def test_l2a_vacuum_gesperrt_warnt_und_migration_bleibt_gueltig(tmp_path):
+    path = tmp_path / "vacuum_gesperrt.sqlite"
+    _klartext_portal_db(path, KLARTEXTE)  # Rollback-Journal: Leser blockiert VACUUM
+    con = _schnelle_verbindung(path)
+    leser = []
+
+    def sperre_vor_vacuum(sql):
+        # Fremde Lesesperre genau zwischen Commit der Migration und VACUUM.
+        if sql.strip().upper() == "VACUUM" and not leser:
+            leser.append(_offener_leser(path))
+
+    con.set_trace_callback(sperre_vor_vacuum)
+    try:
+        with pytest.warns(RuntimeWarning, match="VACUUM"):
+            assert migrate_plaintext_portal_links(con) == len(KLARTEXTE)
+    finally:
+        con.set_trace_callback(None)
+        con.close()
+        for l in leser:
+            l.execute("ROLLBACK")
+            l.close()
+    assert leser, "Sperre wurde nicht gesetzt"
+    gespeichert = _tokens_in_db(path)
+    assert all(t.startswith("sha256:") for t in gespeichert)  # Migration committet
+    assert verify_portal_link(path, KLARTEXTE[0])["client_id"] == "K-0"
+
+
+def test_l2b_sitzungsmigration_ohne_altbestand_ist_leerlauf(tmp_path):
+    path = tmp_path / "sitzung_leer.sqlite"
+    init_schema(path)
+    tid = create_tenant(path, "A")
+    register_user(path, tid, "u@example.invalid", PW)
+    tok = login(path, tid, "u@example.invalid", PW)
+    con = get_connection(path)
+    anweisungen = []
+    con.set_trace_callback(anweisungen.append)
+    assert migrate_plaintext_sessions(con) == 0
+    con.close()
+    assert all(a.lstrip().upper().startswith("SELECT") for a in anweisungen), anweisungen
+    vorher = path.read_bytes()
+    for _ in range(3):
+        assert verify_session(path, tok)["tenant_id"] == tid
+    assert path.read_bytes() == vorher  # kein VACUUM bei wiederholter Pruefung
+
+
+def test_l2b_sitzungsmigration_mit_altbestand_arbeitet(tmp_path):
+    path = tmp_path / "sitzung_alt.sqlite"
+    init_schema(path)
+    tid = create_tenant(path, "A")
+    uid = register_user(path, tid, "u@example.invalid", PW)
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO sessions (session_token, user_id, tenant_id, expires_at) "
+                "VALUES ('SITZUNGPLATZHALTER-ALT', ?, ?, '2999-01-01T00:00:00+00:00')", (uid, tid))
+    con.commit()
+    con.close()
+    con = get_connection(path)
+    anweisungen = []
+    con.set_trace_callback(anweisungen.append)
+    assert migrate_plaintext_sessions(con) == 1
+    con.close()
+    assert any(a.strip().upper() == "VACUUM" for a in anweisungen)
+
+
+def test_l2c_nan_ttl_wird_als_nicht_positive_dauer_abgewiesen(db):
+    _heim, ziel, _root_id, sup = _support(db)
+    with pytest.raises(AccessContractError, match="muss > 0"):
+        grant_jit_access(db, ziel, sup, reason="Vorgang 10", ttl_minutes=float("nan"))
+    with pytest.raises(AccessContractError, match="hoechstens"):
+        grant_jit_access(db, ziel, sup, reason="Vorgang 11", ttl_minutes=float("inf"))
