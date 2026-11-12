@@ -16,7 +16,9 @@ blockiert).
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+import warnings
 from pathlib import Path
 
 SCHEMA = """
@@ -200,7 +202,73 @@ def normalize_role(role: str) -> str:
     return LEGACY_ROLE_MAP.get(role, role)
 
 
+DB_FILE_MODE = 0o600  # Kern-DB enthaelt Passwort-Hashes und Audit-Log: nur Eigentuemer
+
+
+def _create_db_file_if_missing(db_path) -> None:
+    """Legt eine NEUE DB-Datei mit Rechten 0600 an, bevor SQLite sie oeffnet
+    (sonst entstuende sie nach umask, typischerweise 0644 = fuer alle lesbar).
+    Bestehende Dateien werden NICHT angefasst; ihre Rechte bleiben, wie der
+    Betreiber sie gesetzt hat. ':memory:' und URI-Pfade bleiben unberuehrt.
+    Auf Windows setzt os.open nur das Schreibschutz-Bit; kein Fehler."""
+    name = str(db_path)
+    if not name or name == ":memory:" or name.startswith("file:"):
+        return
+    try:
+        fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, DB_FILE_MODE)
+    except FileExistsError:
+        return
+    except OSError:
+        return  # z.B. Verzeichnis fehlt: sqlite3.connect meldet den Fehler wie bisher
+    os.close(fd)
+
+
+def begin_secure_rewrite(con: sqlite3.Connection) -> None:
+    """Vor dem Ueberschreiben geheimer Altwerte (Klartext-Schluessel) aufrufen:
+    secure_delete laesst SQLite freigegebene Inhalte mit Nullen ueberschreiben.
+    Nur aufrufen, wenn wirklich etwas zu ueberschreiben ist."""
+    con.execute("PRAGMA secure_delete = ON")
+
+
+def finish_secure_rewrite(con: sqlite3.Connection) -> None:
+    """Nach dem Commit einer Migration geheimer Altwerte (nur wenn wirklich
+    Zeilen umgeschrieben wurden, also einmalig je Altbestand).
+
+    secure_delete allein reicht nicht: beim Umverteilen von Zellen auf andere
+    Seiten bleiben alte Zellbytes im unbenutzten Bereich belegter Seiten stehen
+    (gemessen: 26 von 40 Alt-Schluesseln noch in der Datei). VACUUM schreibt
+    jede Seite neu; im WAL-Modus ersetzt danach ein Checkpoint mit TRUNCATE
+    die alten Seiten in der Hauptdatei und leert das WAL.
+
+    Halten andere Verbindungen gerade eine Sperre, scheitert VACUUM mit
+    OperationalError. Die Migration ist dann schon committet (Spalte gehasht,
+    Links/Sitzungen gelten weiter); es bleibt nur der Rest in der Datei. Dann
+    eine RuntimeWarning statt eines Abbruchs der Anmeldung: Abhilfe ist ein
+    manuelles VACUUM ohne parallele Zugriffe. Gleiche Warnung, wenn im
+    WAL-Modus ein Leser den Checkpoint blockiert (busy-Rueckgabe)."""
+    try:
+        con.execute("VACUUM")
+        if str(con.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+            # Ein offener Leser blockiert den Checkpoint OHNE Ausnahme: die
+            # erste Ergebnisspalte (busy) ist dann ungleich 0.
+            busy = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+            if busy:
+                warnings.warn(
+                    "Klartext-Altwerte migriert, aber WAL-Checkpoint nicht vollstaendig "
+                    "(andere Verbindung liest); Reste koennen bis zum naechsten Checkpoint "
+                    "in Hauptdatei und WAL stehen",
+                    RuntimeWarning, stacklevel=2,
+                )
+    except sqlite3.OperationalError as fehler:
+        warnings.warn(
+            f"Klartext-Altwerte migriert, aber VACUUM nicht moeglich ({fehler}); "
+            "Reste koennen in der DB-Datei stehen, VACUUM ohne parallele Zugriffe ausfuehren",
+            RuntimeWarning, stacklevel=2,
+        )
+
+
 def get_connection(db_path: Path) -> sqlite3.Connection:
+    _create_db_file_if_missing(db_path)
     con = sqlite3.connect(db_path)
     con.execute("PRAGMA foreign_keys = ON")
     return con
@@ -228,5 +296,53 @@ def init_schema(db_path: Path) -> None:
         "account_type TEXT NOT NULL DEFAULT 'HUMAN' "
         "CHECK (account_type IN ('HUMAN', 'SERVICE'))",
     )
+    migrate_feature_flags_unique(con)
     con.commit()
     con.close()
+    # Portal-Tokens im Altbestand hashen (lazy import: portal_links importiert db).
+    from portal_links import migrate_plaintext_portal_links
+    con = get_connection(db_path)
+    migrate_plaintext_portal_links(con)
+    con.close()
+
+
+# Gewinnerregel fuer mehrere Eintraege desselben Flags (flag_key, tenant_id).
+# Juengster Eintrag gewinnt -- aber updated_at hat nur Sekundenaufloesung,
+# und die rowid ist kein verlaesslicher Zeitbezug (Tabelle ohne INTEGER
+# PRIMARY KEY, VACUUM darf rowids neu vergeben). Bei gleichem updated_at ist
+# "juengster" also NICHT sicher bestimmbar; dann gewinnt der sichere Zustand
+# im Sinne von is_enabled (Deny-by-default, "kein Eintrag = aus"): erst
+# enabled=0, dann der kleinere Rollout-Anteil. Fuer einen Kill-Switch heisst
+# das: im Zweifel bleibt die Funktion abgeschaltet.
+FLAG_WINNER_ORDER = "updated_at DESC, enabled ASC, rollout_prozent ASC"
+
+
+def migrate_feature_flags_unique(con: sqlite3.Connection) -> int:
+    """Behebt, dass globale Flags (tenant_id NULL) mehrfach gespeichert werden
+    konnten: NULL ist in SQLite-Primaerschluesseln untereinander verschieden,
+    ON CONFLICT griff deshalb nie, Abschalten erzeugte eine zweite Zeile.
+
+    1. Doppelzeilen je (flag_key, tenant_id) nach FLAG_WINNER_ORDER auf genau
+       eine Zeile reduzieren.
+    2. Eindeutigen Index auf (flag_key, COALESCE(tenant_id, '')) anlegen.
+    Idempotent: ohne Doppelzeilen und mit vorhandenem Index aendert sich
+    nichts. Gibt die Zahl entfernter Zeilen zurueck."""
+    entfernt = 0
+    gruppen = con.execute(
+        "SELECT flag_key, tenant_id FROM feature_flags "
+        "GROUP BY flag_key, COALESCE(tenant_id, '') HAVING COUNT(*) > 1"
+    ).fetchall()
+    for flag_key, tenant_id in gruppen:
+        rowids = [r[0] for r in con.execute(
+            "SELECT rowid FROM feature_flags WHERE flag_key = ? AND tenant_id IS ? "
+            f"ORDER BY {FLAG_WINNER_ORDER}",
+            (flag_key, tenant_id),
+        )]
+        for rowid in rowids[1:]:
+            con.execute("DELETE FROM feature_flags WHERE rowid = ?", (rowid,))
+            entfernt += 1
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_feature_flags_key_scope "
+        "ON feature_flags(flag_key, COALESCE(tenant_id, ''))"
+    )
+    return entfernt

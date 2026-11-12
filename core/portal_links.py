@@ -15,17 +15,47 @@ in der `portal_links`-Tabelle, niemals im Client-Parameter.
 """
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from db import get_connection
+from auth import ACTIVE_STATUS
+from db import begin_secure_rewrite, finish_secure_rewrite, get_connection
 
 PORTAL_LINK_TTL_HOURS = 72  # Demo-/Praesentationszwecke: 3 Tage Gueltigkeit
 
 
+PORTAL_TOKEN_DIGEST_PREFIX = "sha256:"
+
+
 class PortalLinkError(Exception):
     pass
+
+
+def portal_token_digest(token: str) -> str:
+    """Portal-Token nur als Hash speichern (gleiches Muster wie
+    auth.session_digest). Der Link traegt den Rohtoken; die DB kennt ihn nicht,
+    eine Kopie der DB enthaelt also keine gueltigen Links."""
+    return PORTAL_TOKEN_DIGEST_PREFIX + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def migrate_plaintext_portal_links(con) -> int:
+    """Alt-Zeilen mit Klartext-Token an Ort und Stelle hashen. Idempotent:
+    bereits gehashte Zeilen (Praefix sha256:) bleiben unberuehrt; ausgegebene
+    Links funktionieren weiter. secrets.token_urlsafe enthaelt nie ':', ein
+    Klartext-Token kann also nicht mit dem Praefix verwechselt werden."""
+    rows = con.execute("SELECT token FROM portal_links WHERE token NOT LIKE ?",
+                       (PORTAL_TOKEN_DIGEST_PREFIX + "%",)).fetchall()
+    if not rows:
+        return 0  # nichts zu tun: keine Schreibvorgaenge, kein Checkpoint
+    begin_secure_rewrite(con)  # Klartext nicht in freien Seiten zuruecklassen
+    for (tok,) in rows:
+        con.execute("UPDATE portal_links SET token = ? WHERE token = ?",
+                    (portal_token_digest(tok), tok))
+    con.commit()
+    finish_secure_rewrite(con)
+    return len(rows)
 
 
 def create_portal_link(db_path: Path, tenant_id: str, client_id: str,
@@ -38,7 +68,7 @@ def create_portal_link(db_path: Path, tenant_id: str, client_id: str,
     con = get_connection(db_path)
     con.execute(
         "INSERT INTO portal_links (token, tenant_id, client_id, expires_at) VALUES (?, ?, ?, ?)",
-        (token, tenant_id, client_id, expires),
+        (portal_token_digest(token), tenant_id, client_id, expires),
     )
     con.commit()
     con.close()
@@ -52,15 +82,21 @@ def verify_portal_link(db_path: Path, token: str) -> dict:
     'existiert nicht' und 'abgelaufen' (verhindert Enumeration, analog zu
     auth.login())."""
     con = get_connection(db_path)
+    migrate_plaintext_portal_links(con)
+    digest = portal_token_digest(token)
     row = con.execute(
-        "SELECT tenant_id, client_id, expires_at, revoked FROM portal_links WHERE token = ?",
-        (token,),
+        "SELECT p.tenant_id, p.client_id, p.expires_at, p.revoked, t.status "
+        "FROM portal_links p LEFT JOIN tenants t ON t.tenant_id = p.tenant_id "
+        "WHERE p.token = ?",
+        (digest,),
     ).fetchone()
     if row is None:
         con.close()
         raise PortalLinkError("Ungueltiger Portal-Link")
-    tenant_id, client_id, expires_at, revoked = row
-    if revoked:
+    tenant_id, client_id, expires_at, revoked, tenant_status = row
+    # Gleiche Regel wie auth.login/verify_session: nur ein ACTIVE-Mandant;
+    # gleiche neutrale Meldung wie bei unbekanntem Token.
+    if revoked or tenant_status != ACTIVE_STATUS:
         con.close()
         raise PortalLinkError("Ungueltiger Portal-Link")
     if datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
@@ -69,7 +105,7 @@ def verify_portal_link(db_path: Path, token: str) -> dict:
 
     con.execute(
         "UPDATE portal_links SET last_used_at = ? WHERE token = ?",
-        (datetime.now(timezone.utc).isoformat(), token),
+        (datetime.now(timezone.utc).isoformat(), digest),
     )
     con.commit()
     con.close()
@@ -78,7 +114,9 @@ def verify_portal_link(db_path: Path, token: str) -> dict:
 
 def revoke_portal_link(db_path: Path, token: str) -> None:
     con = get_connection(db_path)
-    con.execute("UPDATE portal_links SET revoked = 1 WHERE token = ?", (token,))
+    migrate_plaintext_portal_links(con)
+    con.execute("UPDATE portal_links SET revoked = 1 WHERE token = ?",
+                (portal_token_digest(token),))
     con.commit()
     con.close()
 

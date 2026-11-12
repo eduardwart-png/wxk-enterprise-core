@@ -15,7 +15,7 @@ from db import init_schema, get_connection
 from auth import create_tenant
 from portal_links import (
     create_portal_link, verify_portal_link, revoke_portal_link,
-    revoke_all_for_client, PortalLinkError,
+    revoke_all_for_client, PortalLinkError, portal_token_digest,
 )
 
 
@@ -110,6 +110,7 @@ def test_last_used_at_wird_aktualisiert(db):
     token = create_portal_link(db, tid, "M-3")
     verify_portal_link(db, token)
     con = get_connection(db)
-    row = con.execute("SELECT last_used_at FROM portal_links WHERE token=?", (token,)).fetchone()
+    row = con.execute("SELECT last_used_at FROM portal_links WHERE token=?",
+                      (portal_token_digest(token),)).fetchone()
     con.close()
     assert row[0] is not None
