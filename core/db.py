@@ -16,6 +16,7 @@ blockiert).
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -200,7 +201,29 @@ def normalize_role(role: str) -> str:
     return LEGACY_ROLE_MAP.get(role, role)
 
 
+DB_FILE_MODE = 0o600  # Kern-DB enthaelt Passwort-Hashes und Audit-Log: nur Eigentuemer
+
+
+def _create_db_file_if_missing(db_path) -> None:
+    """Legt eine NEUE DB-Datei mit Rechten 0600 an, bevor SQLite sie oeffnet
+    (sonst entstuende sie nach umask, typischerweise 0644 = fuer alle lesbar).
+    Bestehende Dateien werden NICHT angefasst; ihre Rechte bleiben, wie der
+    Betreiber sie gesetzt hat. ':memory:' und URI-Pfade bleiben unberuehrt.
+    Auf Windows setzt os.open nur das Schreibschutz-Bit; kein Fehler."""
+    name = str(db_path)
+    if not name or name == ":memory:" or name.startswith("file:"):
+        return
+    try:
+        fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, DB_FILE_MODE)
+    except FileExistsError:
+        return
+    except OSError:
+        return  # z.B. Verzeichnis fehlt: sqlite3.connect meldet den Fehler wie bisher
+    os.close(fd)
+
+
 def get_connection(db_path: Path) -> sqlite3.Connection:
+    _create_db_file_if_missing(db_path)
     con = sqlite3.connect(db_path)
     con.execute("PRAGMA foreign_keys = ON")
     return con
@@ -228,5 +251,53 @@ def init_schema(db_path: Path) -> None:
         "account_type TEXT NOT NULL DEFAULT 'HUMAN' "
         "CHECK (account_type IN ('HUMAN', 'SERVICE'))",
     )
+    migrate_feature_flags_unique(con)
     con.commit()
     con.close()
+    # Portal-Tokens im Altbestand hashen (lazy import: portal_links importiert db).
+    from portal_links import migrate_plaintext_portal_links
+    con = get_connection(db_path)
+    migrate_plaintext_portal_links(con)
+    con.close()
+
+
+# Gewinnerregel fuer mehrere Eintraege desselben Flags (flag_key, tenant_id).
+# Juengster Eintrag gewinnt -- aber updated_at hat nur Sekundenaufloesung,
+# und die rowid ist kein verlaesslicher Zeitbezug (Tabelle ohne INTEGER
+# PRIMARY KEY, VACUUM darf rowids neu vergeben). Bei gleichem updated_at ist
+# "juengster" also NICHT sicher bestimmbar; dann gewinnt der sichere Zustand
+# im Sinne von is_enabled (Deny-by-default, "kein Eintrag = aus"): erst
+# enabled=0, dann der kleinere Rollout-Anteil. Fuer einen Kill-Switch heisst
+# das: im Zweifel bleibt die Funktion abgeschaltet.
+FLAG_WINNER_ORDER = "updated_at DESC, enabled ASC, rollout_prozent ASC"
+
+
+def migrate_feature_flags_unique(con: sqlite3.Connection) -> int:
+    """Behebt, dass globale Flags (tenant_id NULL) mehrfach gespeichert werden
+    konnten: NULL ist in SQLite-Primaerschluesseln untereinander verschieden,
+    ON CONFLICT griff deshalb nie, Abschalten erzeugte eine zweite Zeile.
+
+    1. Doppelzeilen je (flag_key, tenant_id) nach FLAG_WINNER_ORDER auf genau
+       eine Zeile reduzieren.
+    2. Eindeutigen Index auf (flag_key, COALESCE(tenant_id, '')) anlegen.
+    Idempotent: ohne Doppelzeilen und mit vorhandenem Index aendert sich
+    nichts. Gibt die Zahl entfernter Zeilen zurueck."""
+    entfernt = 0
+    gruppen = con.execute(
+        "SELECT flag_key, tenant_id FROM feature_flags "
+        "GROUP BY flag_key, COALESCE(tenant_id, '') HAVING COUNT(*) > 1"
+    ).fetchall()
+    for flag_key, tenant_id in gruppen:
+        rowids = [r[0] for r in con.execute(
+            "SELECT rowid FROM feature_flags WHERE flag_key = ? AND tenant_id IS ? "
+            f"ORDER BY {FLAG_WINNER_ORDER}",
+            (flag_key, tenant_id),
+        )]
+        for rowid in rowids[1:]:
+            con.execute("DELETE FROM feature_flags WHERE rowid = ?", (rowid,))
+            entfernt += 1
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_feature_flags_key_scope "
+        "ON feature_flags(flag_key, COALESCE(tenant_id, ''))"
+    )
+    return entfernt

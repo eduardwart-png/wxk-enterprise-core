@@ -21,7 +21,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from db import get_connection
-from rbac import require_role, log_audit
+from rbac import PermissionError_, require_role, log_audit
+
+
+# Obergrenze fuer die Laufzeit eines JIT-Grants (ADR-001: "zeitlich begrenzter
+# Grant", "automatisches Expiry"): hoechstens ein Arbeitstag. Laengerer Bedarf
+# braucht einen neuen, erneut begruendeten und protokollierten Grant.
+MAX_JIT_TTL_MINUTES = 480
+
+# Mindestrang auf Platform-Ebene fuer Erteilen, Nutzen und Widerrufen.
+JIT_MIN_PLATFORM_ROLE = "PLATFORM_SUPPORT"
 
 
 class AccessContractError(Exception):
@@ -57,11 +66,14 @@ def grant_jit_access(db_path: Path, tenant_id: str, actor_user_id: str,
         )
     if ttl_minutes <= 0:
         raise AccessContractError("ttl_minutes muss > 0 sein")
+    if ttl_minutes > MAX_JIT_TTL_MINUTES:
+        raise AccessContractError(
+            f"ttl_minutes darf hoechstens {MAX_JIT_TTL_MINUTES} betragen")
 
     con = get_connection(db_path)
     try:
         # Deny-by-default: nur Platform-Ebene ab PLATFORM_SUPPORT darf erteilen.
-        require_role(_actor_session_ctx(con, actor_user_id), "PLATFORM_SUPPORT",
+        require_role(_actor_session_ctx(con, actor_user_id), JIT_MIN_PLATFORM_ROLE,
                      scope="platform")
         grant_id = f"JIT-{uuid.uuid4().hex[:12]}"
         expires = (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).isoformat()
@@ -87,9 +99,19 @@ def check_jit_access(db_path: Path, actor_user_id: str, tenant_id: str) -> bool:
 
     Verlangt IMMER einen tenant_id-Bezug -- es gibt keinen globalen Bypass ohne
     Tenant (Abnahme: "jede API mit tenant context"). Kein Grant / abgelaufen /
-    widerrufen -> False (deny-by-default)."""
+    widerrufen -> False (deny-by-default).
+
+    Die Platform-Rolle wird bei JEDER Pruefung erneut verlangt: verliert der
+    Nutzer PLATFORM_SUPPORT (oder hoeher), endet der Zugriff sofort, auch wenn
+    der Grant noch laeuft."""
     now = datetime.now(timezone.utc).isoformat()
     con = get_connection(db_path)
+    try:
+        require_role(_actor_session_ctx(con, actor_user_id), JIT_MIN_PLATFORM_ROLE,
+                     scope="platform")
+    except PermissionError_:
+        con.close()
+        return False
     row = con.execute(
         "SELECT 1 FROM jit_grants "
         "WHERE user_id = ? AND tenant_id = ? AND revoked = 0 AND expires_at > ? "
@@ -102,8 +124,15 @@ def check_jit_access(db_path: Path, actor_user_id: str, tenant_id: str) -> bool:
 
 def revoke_jit_access(db_path: Path, grant_id: str, revoked_by: str) -> None:
     """Widerruft einen Grant sofort (greift unabhaengig von der Rest-TTL).
-    Der Widerruf wird ueber log_audit protokolliert."""
+    `revoked_by` muss ein Nutzer mit mindestens PLATFORM_SUPPORT sein
+    (PermissionError_ sonst); der Widerruf wird ueber log_audit protokolliert."""
     con = get_connection(db_path)
+    try:
+        require_role(_actor_session_ctx(con, revoked_by), JIT_MIN_PLATFORM_ROLE,
+                     scope="platform")
+    except Exception:
+        con.close()
+        raise
     row = con.execute(
         "SELECT tenant_id FROM jit_grants WHERE grant_id = ?", (grant_id,),
     ).fetchone()

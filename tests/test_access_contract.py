@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core"))
 import pytest
 from db import init_schema, get_connection
 from auth import (
-    create_tenant, register_user, verify_session, login,
+    create_tenant, register_user, register_platform_user, verify_session, login,
     assert_tenant_match, TenantIsolationError,
 )
 from rbac import get_audit_trail, PermissionError_
@@ -30,11 +30,18 @@ def db(tmp_path):
     return db_path
 
 
+def _platform_user(db, tenant_id, email, role):
+    """Platform-Rollen nur ueber register_platform_user (B1): erst ein
+    PLATFORM_ROOT per Erstanlage, dann vergibt dieser die Rolle."""
+    root = register_platform_user(db, tenant_id, "root@example.invalid", "supersicher123",
+                                  role="PLATFORM_ROOT")
+    return register_platform_user(db, tenant_id, email, "supersicher123",
+                                  role=role, actor_user_id=root)
+
+
 def _support_user(db, tenant_id):
     """Ein Platform-Support-Mitarbeiter (Platform-Rolle, eigener Tenant)."""
-    uid = register_user(db, tenant_id, "support@plattform.example", "supersicher123",
-                        role="PLATFORM_SUPPORT")
-    return uid
+    return _platform_user(db, tenant_id, "support@plattform.example", "PLATFORM_SUPPORT")
 
 
 def _support_ctx(uid, home_tenant_id):
@@ -181,8 +188,7 @@ def test_platform_auditor_darf_keinen_grant_erteilen(db):
     liegt unter PLATFORM_SUPPORT (Rang 1) und darf nicht erteilen."""
     home = create_tenant(db, "Plattform-Heimat")
     ziel = create_tenant(db, "Kunde A")
-    auditor = register_user(db, home, "auditor@plattform.example", "supersicher123",
-                           role="PLATFORM_AUDITOR")
+    auditor = _platform_user(db, home, "auditor@plattform.example", "PLATFORM_AUDITOR")
     with pytest.raises(PermissionError_):
         grant_jit_access(db, ziel, auditor, reason="nur gucken", ttl_minutes=60)
 

@@ -9,24 +9,36 @@ Nachvollziehbarkeit).
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from pathlib import Path
 
-from db import get_connection
+from db import FLAG_WINNER_ORDER, get_connection
 
 
 def set_flag(db_path: Path, flag_key: str, enabled: bool, tenant_id: str | None = None,
              rollout_prozent: int = 100, beschreibung: str = "") -> None:
+    """Setzt ein Flag (tenant_id None = globaler Default). Aktualisiert per
+    `tenant_id IS ?`, damit auch der globale Eintrag (NULL) getroffen wird;
+    ON CONFLICT ueber den Primaerschluessel griff bei NULL nie (B3). In einer
+    noch nicht migrierten DB werden dabei auch alle Doppelzeilen gleichgesetzt."""
+    werte = (int(enabled), rollout_prozent, beschreibung, flag_key, tenant_id)
+    update = ("UPDATE feature_flags SET enabled = ?, rollout_prozent = ?, beschreibung = ?, "
+              "updated_at = datetime('now') WHERE flag_key = ? AND tenant_id IS ?")
     con = get_connection(db_path)
-    con.execute(
-        "INSERT INTO feature_flags (flag_key, tenant_id, enabled, rollout_prozent, beschreibung, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, datetime('now')) "
-        "ON CONFLICT(flag_key, tenant_id) DO UPDATE SET "
-        "enabled=excluded.enabled, rollout_prozent=excluded.rollout_prozent, "
-        "beschreibung=excluded.beschreibung, updated_at=datetime('now')",
-        (flag_key, tenant_id, int(enabled), rollout_prozent, beschreibung),
-    )
-    con.commit()
-    con.close()
+    try:
+        if con.execute(update, werte).rowcount == 0:
+            try:
+                con.execute(
+                    "INSERT INTO feature_flags (flag_key, tenant_id, enabled, rollout_prozent, "
+                    "beschreibung, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                    (flag_key, tenant_id, int(enabled), rollout_prozent, beschreibung),
+                )
+            except sqlite3.IntegrityError:
+                # Gleichzeitiger Erst-Eintrag (eindeutiger Index): dann aktualisieren.
+                con.execute(update, werte)
+        con.commit()
+    finally:
+        con.close()
 
 
 def is_enabled(db_path: Path, flag_key: str, tenant_id: str) -> bool:
@@ -40,7 +52,8 @@ def is_enabled(db_path: Path, flag_key: str, tenant_id: str) -> bool:
     if row is None:
         row = con.execute(
             "SELECT enabled, rollout_prozent FROM feature_flags "
-            "WHERE flag_key = ? AND tenant_id IS NULL", (flag_key,),
+            f"WHERE flag_key = ? AND tenant_id IS NULL ORDER BY {FLAG_WINNER_ORDER} LIMIT 1",
+            (flag_key,),
         ).fetchone()
     con.close()
     if row is None:

@@ -19,10 +19,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from db import get_connection, normalize_role
-from rbac import log_audit
+from rbac import PLATFORM_RANG, PermissionError_, log_audit, require_role
 
 PBKDF2_ITERATIONS = 600_000  # OWASP-Empfehlung 2023+ fuer PBKDF2-SHA256
 SESSION_TTL_HOURS = 12
+
+# Einziger Status, der Anmeldung und Sitzungen erlaubt (Schema: users.status
+# ACTIVE|DISABLED, tenants.status ACTIVE|SUSPENDED|ARCHIVED). Jeder andere oder
+# unbekannte Wert wird abgewiesen (deny-by-default).
+ACTIVE_STATUS = "ACTIVE"
+
+# Fester Salt fuer den Blind-Hash bei unbekanntem/inaktivem Konto: gleicher
+# Rechenaufwand wie bei falschem Passwort, damit die Antwortzeit nicht
+# verraet, ob ein Konto existiert (Zusage im Docstring von login()).
+_BLIND_SALT = bytes(16)
 
 
 SESSION_DIGEST_PREFIX = "sha256:"
@@ -70,8 +80,12 @@ def create_tenant(db_path: Path, name: str) -> str:
     return tenant_id
 
 
-def register_user(db_path: Path, tenant_id: str, email: str, password: str,
-                   role: str = "VIEWER", account_type: str = "HUMAN") -> str:
+def _is_platform_role(role: str) -> bool:
+    return normalize_role(role).upper() in PLATFORM_RANG
+
+
+def _insert_user(db_path: Path, tenant_id: str, email: str, password: str,
+                 role: str, account_type: str, con=None) -> str:
     if len(password) < 12:
         raise AuthError("Passwort zu kurz (Mindestlaenge 12 Zeichen, Security Baseline)")
     # Service Accounts (z.B. Integrations-/Bot-Konten) werden bewusst von
@@ -79,12 +93,11 @@ def register_user(db_path: Path, tenant_id: str, email: str, password: str,
     # Verhaltensbruch fuer bestehende Aufrufer.
     if account_type not in ("HUMAN", "SERVICE"):
         raise AuthError(f"Ungueltiger account_type: {account_type!r} (erlaubt: HUMAN, SERVICE)")
-    # Legacy-Rollennamen (OWNER/ADMIN/...) transparent auf das neue
-    # Rollenmodell abbilden, damit Alt-Konsumenten nicht crashen (ADR-001).
-    role = normalize_role(role)
     pw_hash, salt = _hash_password(password)
     user_id = f"U-{uuid.uuid4().hex[:12]}"
-    con = get_connection(db_path)
+    eigene = con is None
+    if eigene:
+        con = get_connection(db_path)
     try:
         con.execute(
             "INSERT INTO users (user_id, tenant_id, email, password_hash, password_salt, account_type) "
@@ -100,29 +113,96 @@ def register_user(db_path: Path, tenant_id: str, email: str, password: str,
         con.rollback()
         raise
     finally:
+        if eigene:
+            con.close()
+    return user_id
+
+
+def register_user(db_path: Path, tenant_id: str, email: str, password: str,
+                   role: str = "VIEWER", account_type: str = "HUMAN") -> str:
+    """Legt einen Nutzer mit einer Tenant-Rolle (TENANT_* oder Legacy
+    OWNER/ADMIN/REVIEWER/VIEWER) an. Platform-Rollen (PLATFORM_*) werden hier
+    abgewiesen (ADR-001: Cross-Tenant nur ueber explizite Platform-Rollen); sie
+    werden ausschliesslich ueber register_platform_user vergeben."""
+    if _is_platform_role(role):
+        raise AuthError("Platform-Rollen werden nur ueber register_platform_user vergeben")
+    # Legacy-Rollennamen (OWNER/ADMIN/...) transparent auf das neue
+    # Rollenmodell abbilden, damit Alt-Konsumenten nicht crashen (ADR-001).
+    return _insert_user(db_path, tenant_id, email, password, normalize_role(role), account_type)
+
+
+def _active_roles(con, user_id: str) -> list[str]:
+    """Rollen eines Nutzers, nur wenn Nutzer UND sein Mandant aktiv sind."""
+    row = con.execute(
+        "SELECT u.status, t.status FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id "
+        "WHERE u.user_id = ?", (user_id,),
+    ).fetchone()
+    if row is None or row[0] != ACTIVE_STATUS or row[1] != ACTIVE_STATUS:
+        return []
+    return [r[0] for r in con.execute(
+        "SELECT role_name FROM user_roles WHERE user_id = ?", (user_id,))]
+
+
+def register_platform_user(db_path: Path, tenant_id: str, email: str, password: str,
+                           role: str, actor_user_id: str | None = None,
+                           account_type: str = "HUMAN") -> str:
+    """Einziger Weg, eine Platform-Rolle (PLATFORM_ROOT/ADMIN/SUPPORT/AUDITOR)
+    zu vergeben (ADR-001 Entscheidung 1).
+
+    - Regelfall: `actor_user_id` ist ein aktiver Nutzer mit PLATFORM_ROOT.
+    - Erstanlage: ohne `actor_user_id` ist genau EIN Aufruf moeglich, und nur
+      fuer role='PLATFORM_ROOT', solange noch kein PLATFORM_ROOT existiert.
+      (Bisher entstand der erste Root ueber register_user(role='PLATFORM_ROOT');
+      dieser Weg ist hierher verlegt.)
+    Jede Vergabe wird als PLATFORM_ROLE_GRANTED im Audit-Log festgehalten.
+    `tenant_id` ist der Heimat-Mandant des Kontos (Schema verlangt ihn)."""
+    if not _is_platform_role(role):
+        raise AuthError("register_platform_user vergibt nur Platform-Rollen (PLATFORM_*)")
+    role = normalize_role(role).upper()
+    con = get_connection(db_path)
+    try:
+        con.execute("BEGIN IMMEDIATE")  # Erstanlage-Pruefung und Anlage atomar
+        if actor_user_id is None:
+            hat_root = con.execute(
+                "SELECT 1 FROM user_roles WHERE role_name = 'PLATFORM_ROOT' LIMIT 1").fetchone()
+            if role != "PLATFORM_ROOT" or hat_root is not None:
+                raise PermissionError_(
+                    "Ohne PLATFORM_ROOT-Akteur nur Erstanlage des ersten PLATFORM_ROOT moeglich")
+        else:
+            require_role({"roles": _active_roles(con, actor_user_id)}, "PLATFORM_ROOT",
+                         scope="platform")
+        user_id = _insert_user(db_path, tenant_id, email, password, role, account_type, con=con)
+    except Exception:
+        con.rollback()
+        raise
+    finally:
         con.close()
+    log_audit(db_path, tenant_id, actor=actor_user_id or "ERSTANLAGE",
+              action="PLATFORM_ROLE_GRANTED", entity=user_id, nachher=role, quelle="auth")
     return user_id
 
 
 def login(db_path: Path, tenant_id: str, email: str, password: str) -> str:
     """Gibt bei Erfolg ein Session-Token zurueck. Wirft AuthError bei
-    falschem Passwort/unbekanntem Nutzer -- KEIN Unterschied in der
-    Fehlermeldung (verhindert User-Enumeration, Security Baseline §43)."""
+    falschem Passwort/unbekanntem Nutzer/inaktivem Nutzer oder Mandanten --
+    KEIN Unterschied in der Fehlermeldung und gleicher Rechenaufwand (in jedem
+    Fall genau eine Passwort-Hash-Berechnung), damit weder Text noch Laufzeit
+    verraten, ob ein Konto existiert (Security Baseline §43)."""
     con = get_connection(db_path)
     row = con.execute(
-        "SELECT user_id, password_hash, password_salt, status FROM users "
-        "WHERE tenant_id = ? AND email = ?",
+        "SELECT u.user_id, u.password_hash, u.password_salt, u.status, t.status "
+        "FROM users u LEFT JOIN tenants t ON t.tenant_id = u.tenant_id "
+        "WHERE u.tenant_id = ? AND u.email = ?",
         (tenant_id, email),
     ).fetchone()
     if row is None:
+        _hash_password(password, _BLIND_SALT)
         con.close()
         raise AuthError("Login fehlgeschlagen")
-    user_id, stored_hash, salt_hex, status = row
-    if status != "ACTIVE":
-        con.close()
-        raise AuthError("Login fehlgeschlagen")
+    user_id, stored_hash, salt_hex, user_status, tenant_status = row
     check_hash, _ = _hash_password(password, bytes.fromhex(salt_hex))
-    if not secrets.compare_digest(check_hash, stored_hash):
+    passwort_ok = secrets.compare_digest(check_hash, stored_hash)
+    if not passwort_ok or user_status != ACTIVE_STATUS or tenant_status != ACTIVE_STATUS:
         con.close()
         raise AuthError("Login fehlgeschlagen")
 
@@ -140,23 +220,36 @@ def login(db_path: Path, tenant_id: str, email: str, password: str) -> str:
 
 def verify_session(db_path: Path, session_token: str) -> dict:
     """Prueft ein Session-Token und gibt {user_id, tenant_id, roles} zurueck.
-    Wirft AuthError bei abgelaufener/widerrufener/unbekannter Session."""
+    Wirft AuthError bei abgelaufener/widerrufener/unbekannter Session und
+    sobald Nutzer oder Mandant nicht mehr ACTIVE sind. Eine aus Statusgruenden
+    abgewiesene Sitzung wird widerrufen: eine spaetere Reaktivierung belebt
+    sie nicht wieder, der Nutzer meldet sich neu an."""
     con = get_connection(db_path)
     migrate_plaintext_sessions(con)
+    digest = session_digest(session_token)
     row = con.execute(
-        "SELECT user_id, tenant_id, expires_at, revoked FROM sessions WHERE session_token = ?",
-        (session_digest(session_token),),
+        "SELECT s.user_id, s.tenant_id, s.expires_at, s.revoked, u.status, t.status "
+        "FROM sessions s "
+        "LEFT JOIN users u ON u.user_id = s.user_id "
+        "LEFT JOIN tenants t ON t.tenant_id = s.tenant_id "
+        "WHERE s.session_token = ?",
+        (digest,),
     ).fetchone()
     if row is None:
         con.close()
         raise AuthError("Ungueltige Session")
-    user_id, tenant_id, expires_at, revoked = row
+    user_id, tenant_id, expires_at, revoked, user_status, tenant_status = row
     if revoked:
         con.close()
         raise AuthError("Session widerrufen")
     if datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
         con.close()
         raise AuthError("Session abgelaufen")
+    if user_status != ACTIVE_STATUS or tenant_status != ACTIVE_STATUS:
+        con.execute("UPDATE sessions SET revoked = 1 WHERE session_token = ?", (digest,))
+        con.commit()
+        con.close()
+        raise AuthError("Session ungueltig: Nutzer oder Mandant nicht aktiv")
 
     roles = [r[0] for r in con.execute(
         "SELECT role_name FROM user_roles WHERE user_id = ? AND tenant_id = ?",

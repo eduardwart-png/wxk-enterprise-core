@@ -16,7 +16,7 @@ import pytest
 from db import init_schema
 from auth import session_digest, migrate_plaintext_sessions  # noqa: E402
 from auth import (
-    create_tenant, register_user, login, verify_session, revoke_session,
+    create_tenant, register_user, register_platform_user, login, verify_session, revoke_session,
     assert_tenant_match, AuthError, TenantIsolationError,
 )
 from rbac import require_role, log_audit, get_audit_trail, PermissionError_
@@ -161,8 +161,8 @@ def test_PLATFORM_ROOT_darf_mandantenuebergreifend(db):
     Cross-Tenant-Bypass (ADR-001 Entscheidung 1)."""
     tenant_a = create_tenant(db, "A")
     tenant_b = create_tenant(db, "B")
-    register_user(db, tenant_a, "root@platform.de", "platform-root-pw-999999",
-                  role="PLATFORM_ROOT")
+    register_platform_user(db, tenant_a, "root@platform.de", "platform-root-pw-999999",
+                           role="PLATFORM_ROOT")  # Erstanlage (B1)
     token = login(db, tenant_a, "root@platform.de", "platform-root-pw-999999")
     ctx = verify_session(db, token)
     assert "PLATFORM_ROOT" in ctx["roles"]
@@ -194,8 +194,10 @@ def test_platform_und_tenant_rang_sind_getrennt(db):
     (niedrigster Platform-Rang) hat NICHT automatisch TENANT_ADMIN-Rechte,
     nur weil er eine Platform-Rolle traegt. Kein impliziter Rang-Durchgriff."""
     tenant_a = create_tenant(db, "A")
-    register_user(db, tenant_a, "auditor@platform.de", "platform-auditor-pw-99",
-                  role="PLATFORM_AUDITOR")
+    root = register_platform_user(db, tenant_a, "root@example.invalid", "platform-root-pw-999999",
+                                  role="PLATFORM_ROOT")
+    register_platform_user(db, tenant_a, "auditor@platform.de", "platform-auditor-pw-99",
+                           role="PLATFORM_AUDITOR", actor_user_id=root)
     token = login(db, tenant_a, "auditor@platform.de", "platform-auditor-pw-99")
     ctx = verify_session(db, token)
     # Platform-Rang wird auf Platform-Ebene erkannt:
@@ -239,8 +241,11 @@ def test_platform_interne_rang_grenzen(db):
     (Platform-intern) getestet -- monoton steigender Rang."""
     tid = create_tenant(db, "P")
     stufen = ["PLATFORM_AUDITOR", "PLATFORM_SUPPORT", "PLATFORM_ADMIN", "PLATFORM_ROOT"]
+    root = register_platform_user(db, tid, "root@example.invalid", "platform-pw-12345678",
+                                  role="PLATFORM_ROOT")
     for i, rolle in enumerate(stufen):
-        register_user(db, tid, f"p{i}@platform.de", "platform-pw-12345678", role=rolle)
+        register_platform_user(db, tid, f"p{i}@platform.de", "platform-pw-12345678",
+                               role=rolle, actor_user_id=root)
         token = login(db, tid, f"p{i}@platform.de", "platform-pw-12345678")
         ctx = verify_session(db, token)
         # erreicht alle Raenge <= dem eigenen ...
