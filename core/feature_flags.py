@@ -34,9 +34,16 @@ def set_flag(db_path: Path, flag_key: str, enabled: bool, tenant_id: str | None 
                     (flag_key, tenant_id, int(enabled), rollout_prozent, beschreibung),
                 )
             except sqlite3.IntegrityError:
-                # Gleichzeitiger Erst-Eintrag (eindeutiger Index): dann aktualisieren.
-                con.execute(update, werte)
+                # Nur ein gleichzeitiger Erst-Eintrag (eindeutiger Index) wird
+                # durch Aktualisieren aufgeloest. Trifft das UPDATE nichts, war
+                # es ein anderer Fehler (Fremdschluessel, CHECK): weiterwerfen,
+                # nichts committen.
+                if con.execute(update, werte).rowcount == 0:
+                    raise
         con.commit()
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()
 

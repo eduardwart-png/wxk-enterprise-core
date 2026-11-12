@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from auth import _active_roles
 from db import get_connection
 from rbac import PermissionError_, require_role, log_audit
 
@@ -39,14 +40,11 @@ class AccessContractError(Exception):
 
 def _actor_session_ctx(con, actor_user_id: str) -> dict:
     """Baut ein minimales session_ctx ({'roles': [...]}) aus den in der DB
-    hinterlegten Rollen des Actors, damit die bestehende `require_role`-
+    hinterlegten Rollen des Nutzers, damit die bestehende `require_role`-
     Pruefung (scope='platform') wiederverwendet werden kann -- keine zweite
-    Rollenlogik."""
-    roles = [r[0] for r in con.execute(
-        "SELECT role_name FROM user_roles WHERE user_id = ?",
-        (actor_user_id,),
-    ).fetchall()]
-    return {"roles": roles}
+    Rollenlogik. Rollen zaehlen nur, solange Nutzer und Heimat-Mandant aktiv
+    sind (dieselbe Regel wie auth.login/verify_session, auth._active_roles)."""
+    return {"roles": _active_roles(con, actor_user_id)}
 
 
 def grant_jit_access(db_path: Path, tenant_id: str, actor_user_id: str,
@@ -64,9 +62,10 @@ def grant_jit_access(db_path: Path, tenant_id: str, actor_user_id: str,
         raise AccessContractError(
             "JIT-Grant benoetigt einen dokumentierten Anlass (reason darf nicht leer sein)"
         )
-    if ttl_minutes <= 0:
+    # Vergleiche positiv formuliert, damit auch NaN abgewiesen wird.
+    if not ttl_minutes > 0:
         raise AccessContractError("ttl_minutes muss > 0 sein")
-    if ttl_minutes > MAX_JIT_TTL_MINUTES:
+    if not ttl_minutes <= MAX_JIT_TTL_MINUTES:
         raise AccessContractError(
             f"ttl_minutes darf hoechstens {MAX_JIT_TTL_MINUTES} betragen")
 

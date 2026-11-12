@@ -20,7 +20,8 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from db import get_connection
+from auth import ACTIVE_STATUS
+from db import begin_secure_rewrite, finish_secure_rewrite, get_connection
 
 PORTAL_LINK_TTL_HOURS = 72  # Demo-/Praesentationszwecke: 3 Tage Gueltigkeit
 
@@ -46,11 +47,14 @@ def migrate_plaintext_portal_links(con) -> int:
     Klartext-Token kann also nicht mit dem Praefix verwechselt werden."""
     rows = con.execute("SELECT token FROM portal_links WHERE token NOT LIKE ?",
                        (PORTAL_TOKEN_DIGEST_PREFIX + "%",)).fetchall()
+    if not rows:
+        return 0  # nichts zu tun: keine Schreibvorgaenge, kein Checkpoint
+    begin_secure_rewrite(con)  # Klartext nicht in freien Seiten zuruecklassen
     for (tok,) in rows:
         con.execute("UPDATE portal_links SET token = ? WHERE token = ?",
                     (portal_token_digest(tok), tok))
-    if rows:
-        con.commit()
+    con.commit()
+    finish_secure_rewrite(con)
     return len(rows)
 
 
@@ -81,14 +85,18 @@ def verify_portal_link(db_path: Path, token: str) -> dict:
     migrate_plaintext_portal_links(con)
     digest = portal_token_digest(token)
     row = con.execute(
-        "SELECT tenant_id, client_id, expires_at, revoked FROM portal_links WHERE token = ?",
+        "SELECT p.tenant_id, p.client_id, p.expires_at, p.revoked, t.status "
+        "FROM portal_links p LEFT JOIN tenants t ON t.tenant_id = p.tenant_id "
+        "WHERE p.token = ?",
         (digest,),
     ).fetchone()
     if row is None:
         con.close()
         raise PortalLinkError("Ungueltiger Portal-Link")
-    tenant_id, client_id, expires_at, revoked = row
-    if revoked:
+    tenant_id, client_id, expires_at, revoked, tenant_status = row
+    # Gleiche Regel wie auth.login/verify_session: nur ein ACTIVE-Mandant;
+    # gleiche neutrale Meldung wie bei unbekanntem Token.
+    if revoked or tenant_status != ACTIVE_STATUS:
         con.close()
         raise PortalLinkError("Ungueltiger Portal-Link")
     if datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):

@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from db import get_connection, normalize_role
+from db import begin_secure_rewrite, finish_secure_rewrite, get_connection, normalize_role
 from rbac import PLATFORM_RANG, PermissionError_, log_audit, require_role
 
 PBKDF2_ITERATIONS = 600_000  # OWASP-Empfehlung 2023+ fuer PBKDF2-SHA256
@@ -48,10 +48,13 @@ def migrate_plaintext_sessions(con) -> int:
     """Alt-Zeilen mit Klartext-Schluessel in place hashen (idempotent; laufende Sitzungen bleiben gueltig)."""
     rows = con.execute("SELECT session_token FROM sessions WHERE session_token NOT LIKE ?",
                        (SESSION_DIGEST_PREFIX + "%",)).fetchall()
+    if not rows:
+        return 0  # nichts zu tun: keine Schreibvorgaenge, kein Checkpoint
+    begin_secure_rewrite(con)  # Klartext nicht in freien Seiten zuruecklassen
     for (tok,) in rows:
         con.execute("UPDATE sessions SET session_token = ? WHERE session_token = ?", (session_digest(tok), tok))
-    if rows:
-        con.commit()
+    con.commit()
+    finish_secure_rewrite(con)
     return len(rows)
 
 

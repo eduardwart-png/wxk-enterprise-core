@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import warnings
 from pathlib import Path
 
 SCHEMA = """
@@ -220,6 +221,40 @@ def _create_db_file_if_missing(db_path) -> None:
     except OSError:
         return  # z.B. Verzeichnis fehlt: sqlite3.connect meldet den Fehler wie bisher
     os.close(fd)
+
+
+def begin_secure_rewrite(con: sqlite3.Connection) -> None:
+    """Vor dem Ueberschreiben geheimer Altwerte (Klartext-Schluessel) aufrufen:
+    secure_delete laesst SQLite freigegebene Inhalte mit Nullen ueberschreiben.
+    Nur aufrufen, wenn wirklich etwas zu ueberschreiben ist."""
+    con.execute("PRAGMA secure_delete = ON")
+
+
+def finish_secure_rewrite(con: sqlite3.Connection) -> None:
+    """Nach dem Commit einer Migration geheimer Altwerte (nur wenn wirklich
+    Zeilen umgeschrieben wurden, also einmalig je Altbestand).
+
+    secure_delete allein reicht nicht: beim Umverteilen von Zellen auf andere
+    Seiten bleiben alte Zellbytes im unbenutzten Bereich belegter Seiten stehen
+    (gemessen: 26 von 40 Alt-Schluesseln noch in der Datei). VACUUM schreibt
+    jede Seite neu; im WAL-Modus ersetzt danach ein Checkpoint mit TRUNCATE
+    die alten Seiten in der Hauptdatei und leert das WAL.
+
+    Halten andere Verbindungen gerade eine Sperre, scheitert VACUUM mit
+    OperationalError. Die Migration ist dann schon committet (Spalte gehasht,
+    Links/Sitzungen gelten weiter); es bleibt nur der Rest in der Datei. Dann
+    eine RuntimeWarning statt eines Abbruchs der Anmeldung: Abhilfe ist ein
+    manuelles VACUUM ohne parallele Zugriffe."""
+    try:
+        con.execute("VACUUM")
+        if str(con.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError as fehler:
+        warnings.warn(
+            f"Klartext-Altwerte migriert, aber VACUUM nicht moeglich ({fehler}); "
+            "Reste koennen in der DB-Datei stehen, VACUUM ohne parallele Zugriffe ausfuehren",
+            RuntimeWarning, stacklevel=2,
+        )
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:

@@ -475,3 +475,177 @@ def test_b10_speicher_db_bleibt_moeglich():
     con = get_connection(":memory:")
     assert con.execute("SELECT 1").fetchone() == (1,)
     con.close()
+
+
+# ------------------------------------------- Nachbesserung nach Pruefung ---
+# N1: set_flag darf Fremdschluessel-/CHECK-Fehler nicht verschlucken.
+
+def test_n1_set_flag_unbekannter_mandant_wirft(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        set_flag(db, "k", False, tenant_id="T-unbekannt")
+    n = sqlite3.connect(db).execute("SELECT COUNT(*) FROM feature_flags").fetchone()[0]
+    assert n == 0
+
+
+def test_n1_set_flag_rollout_ausserhalb_wirft(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        set_flag(db, "neu", True, rollout_prozent=150)
+    set_flag(db, "vorhanden", True)
+    with pytest.raises(sqlite3.IntegrityError):
+        set_flag(db, "vorhanden", True, rollout_prozent=-1)
+    rows = sqlite3.connect(db).execute(
+        "SELECT flag_key, rollout_prozent FROM feature_flags ORDER BY flag_key").fetchall()
+    assert rows == [("vorhanden", 100)]
+
+
+def test_n1_set_flag_vorhandener_eintrag_wird_aktualisiert(db):
+    tid = create_tenant(db, "A")
+    set_flag(db, "k", True, tenant_id=tid, rollout_prozent=100)
+    set_flag(db, "k", False, tenant_id=tid, rollout_prozent=40)
+    rows = sqlite3.connect(db).execute(
+        "SELECT enabled, rollout_prozent FROM feature_flags WHERE flag_key = 'k'").fetchall()
+    assert rows == [(0, 40)]
+    assert is_enabled(db, "k", tid) is False
+
+
+# R6: is_enabled folgt der Gewinnerregel auch OHNE vorherige Migration.
+
+def test_r6_is_enabled_altbestand_ohne_migration_folgt_gewinnerregel(tmp_path):
+    alt = tmp_path / "alt_ohne_migration.sqlite"
+    con = sqlite3.connect(alt)
+    con.executescript(ALT_FLAGS)
+    con.close()
+    assert is_enabled(alt, "neu_aus", "T-x") is False   # juengster ist aus
+    assert is_enabled(alt, "neu_an", "T-x") is True     # juengster ist an
+    assert is_enabled(alt, "gleichstand", "T-x") is False  # nicht bestimmbar -> aus
+    assert is_enabled(alt, "neu_an", "T-a") is False    # Tenant-Eintrag hat Vorrang
+    # keine Migration ausgeloest: Doppelzeilen noch vorhanden
+    assert len([r for r in _flags_dump(alt) if r[0] == "neu_aus"]) == 2
+
+
+# R1: Nach der Migration steht kein Klartext mehr in den Dateibytes.
+
+def _datei_bytes(path):
+    daten = b""
+    for endung in ("", "-wal"):
+        p = Path(str(path) + endung)
+        if p.exists():
+            daten += p.read_bytes()
+    return daten
+
+
+def _klartext_portal_db(path, klartexte, wal=False):
+    init_schema(path)
+    tid = create_tenant(path, "A")
+    con = sqlite3.connect(path)
+    if wal:
+        con.execute("PRAGMA journal_mode=WAL")
+    for i, tok in enumerate(klartexte):
+        con.execute("INSERT INTO portal_links (token, tenant_id, client_id, expires_at) "
+                    "VALUES (?, ?, ?, '2999-01-01T00:00:00+00:00')", (tok, tid, f"K-{i}"))
+    con.commit()
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.close()
+    assert klartexte[0].encode() in _datei_bytes(path)  # Vorbedingung: Klartext liegt in der Datei
+
+
+@pytest.mark.parametrize("wal", [False, True])
+def test_r1_portal_migration_hinterlaesst_keinen_klartext_in_datei(tmp_path, wal):
+    path = tmp_path / "portal_bytes.sqlite"
+    klartexte = [f"ALTBESTANDPLATZHALTER{i:02d}" + "q" * 24 for i in range(3)]
+    _klartext_portal_db(path, klartexte, wal=wal)
+    init_schema(path)
+    daten = _datei_bytes(path)
+    assert not any(t.encode() in daten for t in klartexte)
+    assert verify_portal_link(path, klartexte[0])["client_id"] == "K-0"  # Link gilt weiter
+
+
+def test_r1_sitzungs_migration_hinterlaesst_keinen_klartext_in_datei(tmp_path):
+    path = tmp_path / "sitzung_bytes.sqlite"
+    init_schema(path)
+    tid = create_tenant(path, "A")
+    uid = register_user(path, tid, "u@example.invalid", PW)
+    klartexte = [f"SITZUNGPLATZHALTER{i:03d}" + "a" * 46 for i in range(40)]
+    con = sqlite3.connect(path)
+    for tok in klartexte:  # Altbestand: Sitzungsschluessel im Klartext
+        con.execute("INSERT INTO sessions (session_token, user_id, tenant_id, expires_at) "
+                    "VALUES (?, ?, ?, '2999-01-01T00:00:00+00:00')", (tok, uid, tid))
+    con.commit()
+    con.close()
+    assert klartexte[0].encode() in _datei_bytes(path)
+    assert verify_session(path, klartexte[0])["tenant_id"] == tid  # migriert und gueltig
+    daten = _datei_bytes(path)
+    assert not any(t.encode() in daten for t in klartexte)
+
+
+def test_r1_migration_ohne_altbestand_aendert_nichts(tmp_path):
+    path = tmp_path / "leer.sqlite"
+    init_schema(path)
+    tid = create_tenant(path, "A")
+    create_portal_link(path, tid, "K-1")
+    vorher = path.read_bytes()
+    init_schema(path)
+    from portal_links import migrate_plaintext_portal_links
+    con = sqlite3.connect(path)
+    assert migrate_plaintext_portal_links(con) == 0
+    con.close()
+    assert path.read_bytes() == vorher
+
+
+# R3: Portal-Link eines nicht aktiven Mandanten wird abgewiesen.
+
+def test_r3_portal_link_aktiver_mandant_gilt(db):
+    tid = create_tenant(db, "A")
+    tok = create_portal_link(db, tid, "K-1")
+    assert verify_portal_link(db, tok)["tenant_id"] == tid
+
+
+@pytest.mark.parametrize("status", ["SUSPENDED", "ARCHIVED"])
+def test_r3_portal_link_gesperrter_mandant_abgewiesen(db, status):
+    tid = create_tenant(db, "A")
+    tok = create_portal_link(db, tid, "K-1")
+    _set_status(db, "tenants", "tenant_id", tid, status)
+    with pytest.raises(PortalLinkError, match="^Ungueltiger Portal-Link$"):
+        verify_portal_link(db, tok)
+
+
+# R2: Statuspruefung fuer Akteur und Beguenstigten im JIT-Pfad.
+
+def test_r2_deaktivierter_akteur_kann_nicht_erteilen(db):
+    _heim, ziel, _root_id, sup = _support(db)
+    _set_status(db, "users", "user_id", sup, "DISABLED")
+    with pytest.raises(PermissionError_):
+        grant_jit_access(db, ziel, sup, reason="Vorgang 5", ttl_minutes=60)
+
+
+def test_r2_deaktivierter_beguenstigter_hat_keinen_jit_zugriff(db):
+    _heim, ziel, _root_id, sup = _support(db)
+    grant_jit_access(db, ziel, sup, reason="Vorgang 6", ttl_minutes=60)
+    assert check_jit_access(db, sup, ziel) is True
+    _set_status(db, "users", "user_id", sup, "DISABLED")
+    assert check_jit_access(db, sup, ziel) is False
+
+
+def test_r2_beguenstigter_mit_gesperrtem_heimatmandant_hat_keinen_zugriff(db):
+    heim, ziel, _root_id, sup = _support(db)
+    grant_jit_access(db, ziel, sup, reason="Vorgang 7", ttl_minutes=60)
+    _set_status(db, "tenants", "tenant_id", heim, "SUSPENDED")
+    assert check_jit_access(db, sup, ziel) is False
+
+
+def test_r2_deaktivierter_akteur_kann_nicht_widerrufen(db):
+    _heim, ziel, root, sup = _support(db)
+    gid = grant_jit_access(db, ziel, sup, reason="Vorgang 8", ttl_minutes=60)
+    _set_status(db, "users", "user_id", root, "DISABLED")
+    with pytest.raises(PermissionError_):
+        revoke_jit_access(db, gid, revoked_by=root)
+    assert check_jit_access(db, sup, ziel) is True
+    revoke_jit_access(db, gid, revoked_by=sup)  # aktiver Support darf widerrufen
+    assert check_jit_access(db, sup, ziel) is False
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), 0, -5, 480.5])
+def test_r2_ungueltige_ttl_liefert_access_contract_error(db, ttl):
+    _heim, ziel, _root_id, sup = _support(db)
+    with pytest.raises(AccessContractError):
+        grant_jit_access(db, ziel, sup, reason="Vorgang 9", ttl_minutes=ttl)
